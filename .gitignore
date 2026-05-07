@@ -1,4 +1,17 @@
-/vendor
-composer.lock
-.phpunit.result.cache
-/.idea
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.wheel-venv/
+dist/
+build/
+*.egg-info/
+
+# Local/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Upstream sync cache
+.cache/

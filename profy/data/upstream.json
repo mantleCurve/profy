@@ -1,0 +1,42 @@
+{
+  "commit": "cce2dd02e0cdad5c504d18d554322098d4ee2c28",
+  "data_files": [
+    "profy/data/global.json",
+    "profy/data/languages/english.json",
+    "profy/data/languages/french.json",
+    "profy/data/languages/german.json",
+    "profy/data/languages/spanish.json"
+  ],
+  "implementation_files": {
+    "config/blasp.php": "094304a18c647a84048ab088db7b6a8b51fcf80fb602d8e449ab4441ed8d0761",
+    "src/Core/Analyzer.php": "1cdd5a874f39225ec51d72bb357bfce7e22d849c4a5c754ced77dd9db827e9ef",
+    "src/Core/Contracts/DriverInterface.php": "ff8cb606007b8278350346dd214e8e63c21021561f5d0fdd5bc306caa176d436",
+    "src/Core/Contracts/MaskStrategyInterface.php": "7c552479cfbe725070e074b13d463156faffe6d0c0a0c9e3093954474ee516ce",
+    "src/Core/Dictionary.php": "1dce423ec8ce64f9dd45b12cc3cb56d54da5fda5fcf1b8e9bde29f855cc4c981",
+    "src/Core/Masking/CallbackMask.php": "d29f9c9170fbfd423c5c97fe3bbd74a3b80c257c023a6b5ab96cbbfe317ed7e1",
+    "src/Core/Masking/CharacterMask.php": "89d2b412bb26457fc7f43948cf3241e8ce38bbc5d708b2a05d08d20d78f1c256",
+    "src/Core/Masking/GrawlixMask.php": "57093b8793a9677a05265f32047f18140cf4c07965256541a515e12781344a83",
+    "src/Core/MatchedWord.php": "c2c585448f13e580eba2bf685f3a8ba952651cc6a3c032a3b55fab5be4a34333",
+    "src/Core/Matchers/CompoundWordDetector.php": "be9398a6ff195cec35fcefc2e3d88061f87ab9ad93614c804cee4b6b8391060a",
+    "src/Core/Matchers/FalsePositiveFilter.php": "a51cb5c81408b2caef72bf17345655aafafee8a765649b9ea671c1767e3649f6",
+    "src/Core/Matchers/PhoneticMatcher.php": "82f9596761cf8607cc5683e70893a3295eb58523d9034d1ee41011e93a888961",
+    "src/Core/Matchers/RegexMatcher.php": "885436b8d06e0ccd57ea69773126997a33d0d6da1b4adab656fdc3ae3e4cc5e9",
+    "src/Core/Normalizers/EnglishNormalizer.php": "bece980abb8af446be706320fe14c8ee2d63f5f00133458c5a3bab5799895663",
+    "src/Core/Normalizers/FrenchNormalizer.php": "d7cb54d97c51b5c749231db02f95ef4787fe90a4f31b99c772f866dd37e6ac6b",
+    "src/Core/Normalizers/GermanNormalizer.php": "afc80bb8e7870aef1bb1119450c02a587281e9cdba47d09f3369749827a3f564",
+    "src/Core/Normalizers/NullNormalizer.php": "478eb08d57e8600e5714ea12cb07df17afb581f4677fd47f1fb18c1677a8c4ca",
+    "src/Core/Normalizers/SpanishNormalizer.php": "23649ecfc2168211140d57c10606734e87cf3b234ffc9916d419dab21b243b77",
+    "src/Core/Normalizers/StringNormalizer.php": "7bfd8e5a346c0966a023074fabeee1695a5983fd876ff64ca6c27551a1b2c5cd",
+    "src/Core/Result.php": "57d108534277f23c2f8346dd7be19133a7595f0aa1c1c787c3108325b9c3dc8b",
+    "src/Core/Score.php": "e81408b32e1b349cac2347e53d92800eb93a2a4ed62d5cc4637bb487e1215db2",
+    "src/Drivers/PatternDriver.php": "69d484e7192acf33b2167819f4cf3e1cc8ab443c943cbd2e6920e452294f46de",
+    "src/Drivers/PhoneticDriver.php": "3994ec938f37477e58ec59dadb9d968775b12d86873f56c7ef81addc0ae1d825",
+    "src/Drivers/PipelineDriver.php": "a62a2cf4e3e57ee94419f030495089c12dc968256955d1514c0e5a02cdbf55e5",
+    "src/Drivers/RegexDriver.php": "c140f9dd945a57fb4b3d70491e218191e1030ed8970f52fdc3648e6de3e6b712",
+    "src/Enums/Severity.php": "7f18e388067080a90d9f7f9f67ffed5e87648cdea7094ff205a6b3f4ecf8be81",
+    "src/PendingCheck.php": "43674cefe63833e20cff8af5367323b2a05d07971d792192c241698a6f435117"
+  },
+  "synced_at": "2026-05-07T05:59:47.678650+00:00",
+  "upstream": "Blaspsoft/blasp",
+  "upstream_url": "https://github.com/Blaspsoft/blasp.git"
+}

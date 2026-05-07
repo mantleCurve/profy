@@ -1,16 +1,19 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: pypi
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,7 +27,12 @@ jobs:
           name: profy-dist
           path: dist/*
       - uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
         with:
           prerelease: true
           files: dist/*
           generate_release_notes: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true

@@ -19,6 +19,14 @@ git push origin v0.1.0a1
 
 Pushing that tag runs the `Release` GitHub Actions workflow, which runs tests, builds the source distribution and wheel, uploads them as workflow artifacts, and attaches them to a GitHub Release.
 
+The same workflow publishes to PyPI using Trusted Publishing. Configure PyPI with:
+
+- Project name: `profy-filter`
+- Owner: `mantleCurve`
+- Repository: `profy`
+- Workflow: `release.yml`
+- Environment: `pypi`
+
 GitHub Releases should include:
 
 - version number

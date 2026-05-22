@@ -343,36 +343,57 @@ class _Dictionary:
         return normalized, span_map
 
 
+_VOWEL_KEYS = frozenset("aeiou")
+_MIN_CONSONANTS_FOR_ELISION = 3
+
+
+def _build_substitution_expression(options: list[str], quantifier: str) -> str:
+    has_multi = any(len(option) > 1 and not re.fullmatch(r"\\.", option) for option in options)
+    if has_multi:
+        parts = [
+            option if re.fullmatch(r"\\.", option) else re.escape(option)
+            for option in options
+        ]
+        return "(?:" + "|".join(parts) + ")" + quantifier + "{!!}"
+    return _escaped_expression(options, quantifier=quantifier) + "{!!}"
+
+
 def _generate_expressions(
     profanities: list[str],
     separators: list[str],
     substitutions: Mapping[str, list[str]],
 ) -> dict[str, re.Pattern[str]]:
     separator_expression = _separator_expression(separators)
-    substitution_expressions: dict[str, str] = {}
+    strict_expressions: dict[str, str] = {}
+    elidable_expressions: dict[str, str] = {}
     for character, options in substitutions.items():
         plain = character.strip("/")
-        has_multi = any(len(option) > 1 and not re.fullmatch(r"\\.", option) for option in options)
-        if has_multi:
-            parts = [
-                option if re.fullmatch(r"\\.", option) else re.escape(option)
-                for option in options
-            ]
-            substitution_expressions[plain] = "(?:" + "|".join(parts) + ")+" + "{!!}"
+        strict_expressions[plain] = _build_substitution_expression(options, "+")
+        if plain in _VOWEL_KEYS:
+            elidable_expressions[plain] = _build_substitution_expression(options, "*")
         else:
-            substitution_expressions[plain] = _escaped_expression(options, quantifier="+") + "{!!}"
+            elidable_expressions[plain] = strict_expressions[plain]
 
-    ordered_substitutions = sorted(
-        substitution_expressions.items(),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    )
+    ordered_strict = sorted(strict_expressions.items(), key=lambda item: len(item[0]), reverse=True)
+    ordered_elidable = sorted(elidable_expressions.items(), key=lambda item: len(item[0]), reverse=True)
+
     expressions: dict[str, re.Pattern[str]] = {}
     for profanity in profanities:
+        lowered = profanity.lower()
+        vowel_positions = [index for index, character in enumerate(lowered) if character in _VOWEL_KEYS]
+        consonant_letters = sum(
+            1 for character in lowered if character.isalpha() and character not in _VOWEL_KEYS
+        )
+        elidable = (
+            len(vowel_positions) == 1
+            and 0 < vowel_positions[0] < len(lowered) - 1
+            and consonant_letters >= _MIN_CONSONANTS_FOR_ELISION
+        )
+        ordered = ordered_elidable if elidable else ordered_strict
         pieces: list[str] = []
         i = 0
         while i < len(profanity):
-            for key, replacement in ordered_substitutions:
+            for key, replacement in ordered:
                 if profanity.startswith(key, i):
                     pieces.append(replacement)
                     i += len(key)

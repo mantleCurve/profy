@@ -3,7 +3,7 @@ from profy import ProfanityFilter, Severity, check_text, clean_text, filter_text
 
 
 def test_version_is_exported():
-    assert profy.__version__ == "0.1.0a1"
+    assert profy.__version__ == "0.1.0a2"
 
 
 def test_straight_match_masks_text():
@@ -86,6 +86,18 @@ def test_german_normalization_masks_original_span():
     assert result.is_offensive
     assert result.clean == "Das ist ********"
     assert result.matches[0].text == "scheisse"
+
+
+def test_vowel_elided_obfuscations_are_caught():
+    for text in ["fck", "sht", "dmn", "what the fck", "sht happens", "oh dmn it"]:
+        result = filter_text(text)
+        assert result.is_offensive, text
+
+
+def test_vowel_elision_does_not_flag_unrelated_short_tokens():
+    for text in ["fc", "ss", "ck", "FC Barcelona", "miss the bus", "a class of students"]:
+        result = filter_text(text)
+        assert result.is_clean, text
 
 
 def test_all_languages_uses_bundled_dictionaries():

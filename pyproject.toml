@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "profy-filter"
-version = "0.1.0a2"
+version = "0.1.1"
 description = "A Python profanity filter forked from Blaspsoft/blasp."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,7 +13,7 @@ license-files = ["LICENSE.md"]
 authors = [{ name = "MantleCurve" }]
 keywords = ["profanity", "filter", "moderation", "text-cleaning", "blasp"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

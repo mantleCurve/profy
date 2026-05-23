@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- First non-alpha release. Same code as 0.1.0a2; dropping the `aN` suffix to publish a stable PyPI version.
+
 ## 0.1.0a2
 
 - Merged additional English wordlists from leo-profanity (MIT), zautumnz/profane-words (WTFPL), web-mech/badwords-list (MIT), and LDNOOBW (CC BY 4.0). `profy/data/languages/english.json` now carries ~2663 base profanities (up from ~1316). New entries default to `Severity.HIGH`; pre-existing curated `severity.mild`/`moderate`/`extreme` classifications are preserved.

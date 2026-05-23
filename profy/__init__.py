@@ -20,4 +20,4 @@ __all__ = [
     "filter_text",
 ]
 
-__version__ = "0.1.0a2"
+__version__ = "0.1.1"

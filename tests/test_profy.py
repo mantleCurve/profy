@@ -100,6 +100,21 @@ def test_vowel_elision_does_not_flag_unrelated_short_tokens():
         assert result.is_clean, text
 
 
+def test_alpha_substring_protection_survives_adjacent_digits():
+    # "hello" contains "hell", but is a legitimate word and must not be masked
+    # even when followed/preceded by digits ("hello9"). Regression for the
+    # substring-protection guard being bypassed by a non-alpha \w-context.
+    for text in ["hello9", "9hello", "hello99", "shell9", "scunthorpe9", "hello9world"]:
+        result = filter_text(text)
+        assert result.is_clean, text
+        assert result.clean == text
+
+    # A bare profanity plus trailing digits has no extra letters forming a
+    # longer word, so it must still be masked.
+    assert filter_text("hell9").clean == "****9"
+    assert filter_text("ass9").clean == "***9"
+
+
 def test_all_languages_uses_bundled_dictionaries():
     result = filter_text("Putain de merde", all_languages=True)
 

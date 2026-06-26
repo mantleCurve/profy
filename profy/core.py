@@ -164,7 +164,12 @@ class ProfanityFilter:
                         continue
 
                     full_word = _full_word_context(working, start, length)
-                    original_full_word = _full_word_context(immutable_normalized, start, length)
+                    # For the Scunthorpe-style substring guard we use the
+                    # surrounding *alphabetic run* rather than the full \w-context.
+                    # A trailing/leading digit (e.g. "hello9") must not strip the
+                    # protection that keeps a real word like "hello" from being
+                    # masked just because it contains the profanity "hell".
+                    original_full_word = _alpha_word_context(immutable_normalized, start, length)
                     if _is_pure_alpha_substring(
                         matched_text,
                         original_full_word,
@@ -477,6 +482,26 @@ def _full_word_context(text: str, start: int, length: int) -> str:
     while left > 0 and re.match(r"\w", text[left - 1], re.UNICODE):
         left -= 1
     while right < len(text) and re.match(r"\w", text[right], re.UNICODE):
+        right += 1
+    return text[left:right]
+
+
+def _alpha_word_context(text: str, start: int, length: int) -> str:
+    """Return the contiguous ASCII-letter run surrounding ``[start, start+length)``.
+
+    Unlike :func:`_full_word_context` (which expands across any ``\\w`` character,
+    digits and underscores included), this expansion stops at the first
+    non-letter. It is used by the substring-protection guard so that a legitimate
+    word ("hello") embedded next to digits ("hello9") is still recognised as the
+    real word, and therefore the profanity it happens to contain ("hell") is not
+    masked. Matching ``[a-zA-Z]`` here mirrors the alphabetic check inside
+    :func:`_is_pure_alpha_substring`.
+    """
+    left = start
+    right = start + length
+    while left > 0 and re.match(r"[a-zA-Z]", text[left - 1]):
+        left -= 1
+    while right < len(text) and re.match(r"[a-zA-Z]", text[right]):
         right += 1
     return text[left:right]
 

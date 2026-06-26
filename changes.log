@@ -1,5 +1,23 @@
 # Profy Changes Log
 
+## 2026-06-26 - Release 0.1.2
+- Bumped version 0.1.1 -> 0.1.2 (pyproject.toml, profy/__init__.py, version test).
+- Updated CHANGELOG.md with the 0.1.2 substring/digit false-positive fix.
+- Merged fix/substring-protection-with-digits into main and tagged v0.1.2 to
+  trigger the GitHub Release + PyPI publish workflow.
+
+## 2026-06-26 (fix/substring-protection-with-digits)
+- Fixed false-positive masking of legitimate words sitting next to digits.
+  - "hello9" was being cleaned to "****o9" because the Scunthorpe-style
+    substring guard (`_is_pure_alpha_substring`) only applied when the entire
+    surrounding `\w`-context was pure alphabetic. A trailing/leading digit made
+    the context non-alpha ("hello9"), disabling the guard so "hell" matched.
+  - Added `_alpha_word_context()` which expands across ASCII letters only, and
+    used it to derive the word passed to the substring guard. Now "hello9",
+    "9hello", "shell9", "scunthorpe9", etc. stay clean, while bare profanities
+    with appended digits ("hell9", "ass9") are still masked.
+  - Added regression test `test_alpha_substring_protection_survives_adjacent_digits`.
+
 ## 2026-06-26
 - Ran `scripts/sync_from_blasp.py`: synced upstream Blasp PHP data.
   - Upstream remained at commit `cce2dd0` (unchanged since previous sync) — no

@@ -1,5 +1,11 @@
 # Profy Changes Log
 
+## 2026-06-26 - Release 0.1.2
+- Bumped version 0.1.1 -> 0.1.2 (pyproject.toml, profy/__init__.py, version test).
+- Updated CHANGELOG.md with the 0.1.2 substring/digit false-positive fix.
+- Merged fix/substring-protection-with-digits into main and tagged v0.1.2 to
+  trigger the GitHub Release + PyPI publish workflow.
+
 ## 2026-06-26 (fix/substring-protection-with-digits)
 - Fixed false-positive masking of legitimate words sitting next to digits.
   - "hello9" was being cleaned to "****o9" because the Scunthorpe-style

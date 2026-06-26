@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Fixed a false positive where a legitimate word adjacent to digits was masked because of a contained profanity. For example `hello9` was cleaned to `****o9` (matching `hell`). The Scunthorpe-style substring guard previously only applied when the entire surrounding `\w`-context was purely alphabetic, so a trailing/leading digit disabled it. The guard now inspects the surrounding alphabetic run (via `_alpha_word_context`), so words like `hello9`, `9hello`, `shell9`, and `scunthorpe9` stay clean while bare profanities with appended digits (`hell9`, `ass9`) are still masked.
+
 ## 0.1.1
 
 - First non-alpha release. Same code as 0.1.0a2; dropping the `aN` suffix to publish a stable PyPI version.

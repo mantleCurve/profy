@@ -1,0 +1,12 @@
+# Profy Changes Log
+
+## 2026-06-26
+- Ran `scripts/sync_from_blasp.py`: synced upstream Blasp PHP data.
+  - Upstream remained at commit `cce2dd0` (unchanged since previous sync) — no
+    new language/global data; only the sync timestamp metadata was refreshed in
+    `profy/data/upstream.json` and `docs/upstream-sync-report.md`.
+- Ran `scripts/sync_external_sources.py`: merged external English wordlists.
+  - Result was idempotent; `english.json` already at 2663 profanities, no new
+    words added on this run.
+- Validated all bundled data JSON parses and ran functional smoke tests of
+  `profy.check_text` / `profy.clean_text` (passing).

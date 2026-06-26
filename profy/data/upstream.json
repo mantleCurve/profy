@@ -36,7 +36,7 @@
     "src/Enums/Severity.php": "7f18e388067080a90d9f7f9f67ffed5e87648cdea7094ff205a6b3f4ecf8be81",
     "src/PendingCheck.php": "43674cefe63833e20cff8af5367323b2a05d07971d792192c241698a6f435117"
   },
-  "synced_at": "2026-05-07T05:59:47.678650+00:00",
+  "synced_at": "2026-06-26T16:55:37.641170+00:00",
   "upstream": "Blaspsoft/blasp",
   "upstream_url": "https://github.com/Blaspsoft/blasp.git"
 }

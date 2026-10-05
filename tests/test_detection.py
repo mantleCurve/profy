@@ -143,6 +143,65 @@ def test_matches_do_not_bleed_into_the_next_word(english, text, clean):
         assert match.text == text[match.position : match.position + match.length]
 
 
+INFLECTED = [
+    # (word, length of the masked stem): doubled-consonant and plain inflections.
+    ("shittier", 5), ("shittiest", 9), ("shittily", 5), ("shittiness", 5), ("shitter", 7), ("shitted", 7),
+    ("shitting", 8), ("shits", 5), ("shitier", 4), ("crappier", 5), ("crappiest", 5), ("crappily", 5),
+    ("crapped", 5), ("crapping", 5), ("craps", 4), ("fucker", 6), ("fuckers", 7), ("fucked", 6),
+    ("bitchier", 5), ("bitchiest", 5), ("bitchily", 5), ("bitchiness", 5), ("bitches", 7),
+    ("damned", 4), ("damning", 4), ("pissed", 6), ("cunts", 5),
+    # A stem's last letter repeated by the ending stays part of the ending.
+    ("naziing", 5),
+]
+
+
+@pytest.mark.parametrize(
+    "word",
+    ["tardiness", "tardily", "spicily", "spiciness", "spookily", "tested", "tester", "hoarily", "spaciness", "hellier"],
+)
+def test_y_endings_need_a_y_adjective_in_the_dictionary(english, word):
+    # "-ier/-ily/-iness" inflect "tardy", "spicy", "spooky", which are not entries.
+    assert english.check(word).clean == word
+
+
+@pytest.mark.parametrize("word, masked", INFLECTED)
+def test_inflected_profanities_are_caught(english, word, masked):
+    result = english.check(word)
+    assert result.is_offensive, word
+    assert result.clean.startswith("*" * masked), (word, result.clean)
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
+        ("f, u, c, khead", "**************"),
+        ("f, u, c, kheads", "**************s"),
+        ("f, u, c, ks", "**********s"),
+        ("sh, itheads", "**********s"),
+        ("sh, ithead", "**********"),
+        ("shit, sing", "****, sing"),
+        ("shit, said", "****, said"),
+    ],
+)
+def test_separator_obfuscation_with_inflections(english, text, clean):
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
+        ("shitxshithell", "shitx********"),
+        ("hellxhellshit", "hellx********"),
+        ("shitshit", "********"),
+        ("fuckfuckfuck", "************"),
+        ("hellohell", "hellohell"),
+        ("shellshell", "shellshell"),
+    ],
+)
+def test_compound_guard_judges_each_occurrence(english, text, clean):
+    assert english.check(text).clean == clean
+
+
 @pytest.mark.parametrize(
     "text, options, clean",
     [

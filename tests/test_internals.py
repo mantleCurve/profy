@@ -129,41 +129,89 @@ def test_spanning_word_boundary_helper():
     assert core._is_spanning_word_boundary("fuck - you", "fuck - yourself", 0)
     assert core._is_spanning_word_boundary("shit, s", "shit, said", 0)
     assert core._is_spanning_word_boundary("t, shit", "it, shit", 1)
+    assert not core._is_spanning_word_boundary("f, u, c, k", "f, u, c, ks", 0)
+    assert not core._is_spanning_word_boundary("sh, ithead", "sh, itheads", 0)
+    assert core._is_spanning_word_boundary("shit, s", "shit, sing", 0)
     assert not core._is_spanning_word_boundary("sh it", "sh it", 0)
     assert not core._is_spanning_word_boundary("shit", "shit", 0)
     assert filter_text("sh itx").is_clean
 
 
 @pytest.mark.parametrize(
-    "matched, word, base, profanities, protected",
+    "matched, before, after, base, parts, protected",
     [
-        ("sh1t", "sh1t", "shit", [], False),
-        ("hell", "hell9o", "hell", [], False),
-        ("hell", "hello", "hell", [], True),
-        ("hell", "hell", "hell", [], False),
-        ("hell", "hells", "hell", [], False),
-        ("hell", "hellfuck", "hell", ["fuck"], False),
-        ("hell", "hellfu", "hell", ["fu"], True),
-        ("hell", "xyzwvu", "hell", [], True),
-        ("cook", "cooks", "cok", [], True),
-        ("cooook", "cooook", "cok", [], False),
-        ("anall", "anally", "anal", [], False),
-        ("ccum", "accumulate", "cum", [], True),
-        ("dth", "zerowidth", "deth", ["ero"], True),
-        ("tard", "astards", "tard", ["ass"], True),
-        ("shit", "xshitfuck", "shit", ["fuck"], False),
-        ("fuck", "dumbassfuck", "fuck", ["ass"], False),
-        ("cuum", "vacuum", "cum", [], True),
-        ("shiit", "shiit", "shit", [], False),
-        ("shiit", "shiits", "shit", [], False),
-        ("fuuck", "fuuckx", "fuck", [], True),
-        ("fuuck", "fuuck", "fuuck", [], False),
-        ("fuuck", "fuuck", "fuuck", [], False),
-        ("fck", "fcks", "fuck", [], False),
+        ("sh1t", "", "", "shit", [], False),
+        ("hell", "", "o", "hell", [], True),
+        ("hell", "", "", "hell", [], False),
+        ("hell", "", "s", "hell", [], False),
+        ("hell", "", "fuck", "hell", ["fuck"], False),
+        ("hell", "", "fu", "hell", ["fu"], True),
+        ("hell", "xyz", "wvu", "hell", [], True),
+        ("cook", "", "s", "cok", [], True),
+        ("cooook", "", "", "cok", [], False),
+        ("anall", "", "y", "anal", [], False),
+        ("ccum", "a", "ulate", "cum", [], True),
+        ("fuuck", "", "", "fuuck", [], False),
+        ("fck", "", "s", "fuck", [], False),
+        ("dth", "zerowi", "", "deth", ["ero"], True),
+        ("tard", "as", "s", "tard", ["ass"], True),
+        ("shit", "x", "fuck", "shit", ["fuck"], False),
+        ("fuck", "dumbass", "", "fuck", ["ass"], False),
+        ("cuum", "va", "", "cum", [], True),
+        ("shiit", "", "", "shit", [], False),
+        ("shiit", "", "s", "shit", [], False),
+        ("fuuck", "", "x", "fuck", [], True),
+        ("shitt", "", "ier", "shit", ["shitty"], False),
+        ("crapp", "", "iest", "crap", ["crappy"], False),
+        ("crapp", "", "ily", "crap", ["crappy"], False),
+        ("shitt", "", "iness", "shit", ["shitty"], False),
+        ("shitt", "", "ier", "shit", [], False),
+        ("shit", "", "ier", "shit", [], True),
+        ("asss", "", "", "ass", [], False),
+        ("hell", "", "ier", "hell", [], True),
+        ("shit", "", "ier", "shit", ["shity"], False),
+        ("tard", "", "iness", "tard", [], True),
+        ("shitt", "", "ery", "shit", [], True),
+        ("asshole", "", "d", "asshole", [], True),
+        ("nazii", "", "ng", "nazi", [], False),
+        ("cock", "", "d", "cock", [], True),
+        # The guard judges this occurrence, not the first one in the word.
+        ("hell", "shitxshit", "", "hell", ["shit"], False),
+        ("shit", "", "xshithell", "shit", ["shit", "hell"], True),
     ],
 )
-def test_pure_alpha_substring_guard(matched, word, base, profanities, protected):
-    assert core._is_pure_alpha_substring(matched, word, base, profanities) is protected
+def test_pure_alpha_substring_guard(matched, before, after, base, parts, protected):
+    assert core._is_pure_alpha_substring(matched, before, after, base, frozenset(parts)) is protected
+
+
+def test_run_index():
+    index = core._RunIndex("ab cd-ef  g", r"\w+")
+    assert index.around(0, 1) == (0, 2)
+    assert index.around(3, 4) == (3, 5)
+    assert index.around(2, 3) == (0, 5)
+    assert index.around(10, 11) == (10, 11)
+    index.split(1, 4)
+    assert (index.starts, index.ends) == ([0, 4, 6, 10], [1, 5, 8, 11])
+    index.split(9, 10)
+    assert (index.starts, index.ends) == ([0, 4, 6, 10], [1, 5, 8, 11])
+    index.split(6, 8)
+    assert (index.starts, index.ends) == ([0, 4, 10], [1, 5, 11])
+    assert core._RunIndex("", r"\w+").around(0, 0) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "token, verdict",
+    [
+        ("123e4567-e89b-12d3-a456-42661417b00b", True),
+        ("-deadbeef1234-", True),
+        ("deadbeef", False),
+        ("a55a55a55", True),
+        ("a55", False),
+        ("f*ck", False),
+    ],
+)
+def test_hex_tokens(token, verdict):
+    assert core._is_hex_token(token) is verdict
 
 
 def test_score_is_capped():

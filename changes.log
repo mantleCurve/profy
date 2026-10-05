@@ -1,5 +1,26 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening, Codex review pass 2)
+- P1 quadratic scanning: `_RunIndex` (bisect over `\w`, hex and letter runs,
+  built once per check and split on masking), cached hex-token verdicts
+  (`_is_hex_token`), bounded before/after windows for the substring guard,
+  bounded next-word lookahead, `\x01`/bisect overlap checks, single-pass mask
+  assembly; dropped the per-pass whitespace re-collapse (provably a no-op) and
+  the identity copy of the position map. "a55"*4000 17.6s -> 0.48s,
+  "shit"*4000 33.6s -> 0.8s; all shapes now ~4x time per 4x length.
+  Removed `_full_word_context`, `_alpha_word_context`, `_is_inside_hex_token`.
+- P2 inflections: full suffix set incl. y -> i forms (`_INFLECTION_SUFFIXES`,
+  `_Y_ENDINGS`, `_is_inflection`): y-endings need a doubled consonant or a
+  y-adjective entry; an ending may start with the stem's repeated last letter.
+- P2 obfuscated plurals across a phrase break: allowed when the next word is
+  a stem of 2+ letters or single letters plus an inflection.
+- P2 compound guard: `_is_pure_alpha_substring(matched, before, after, ...)`
+  receives the letters around the actual occurrence.
+- Dictionary scan: 830 -> 845 flagged (15 y-adjective forms such as cockily,
+  smuttiness; 0 newly clean).
+- Coverage: moved the claimed-span overlap check into `_claim` (CPython 3.9
+  did not trace the `continue` after a multi-line condition).
+
 ## 2026-10-06 (fix/codex-review-hardening, round 2 + Codex review pass 1)
 - Doubled letters: `_RARELY_DOUBLED` (a h i j k q u v w x y; each doubled in
   <0.5% of /usr/share/dict/words entries containing it, next letter d at 1.7%)

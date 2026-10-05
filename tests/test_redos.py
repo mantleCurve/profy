@@ -9,6 +9,7 @@ with a hard timeout, so a regression fails instead of hanging the test run.
 import json
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -131,3 +132,39 @@ def test_star_runs_are_still_masked(english, length):
     result = english.check("*" * length)
     assert result.is_offensive
     assert result.clean == "*" * length
+
+
+SCALING_SHAPES = {
+    "a55": lambda n: "a55" * n,
+    "ab": lambda n: "ab" * n,
+    "a1": lambda n: "a1" * n,
+    "x": lambda n: "x" * n,
+    "f*": lambda n: "f*" * n,
+    "hex": lambda n: ("deadbeef0123" * n)[: 3 * n],
+    "long word": lambda n: ("thequickbrownfox" * n)[: 3 * n],
+    "shit": lambda n: "shit" * n,
+    "fuck ": lambda n: "fuck " * n,
+    "a55 ": lambda n: "a55 " * n,
+    "uuid": lambda n: "123e4567-e89b-12d3-a456-42661417b00b " * (n // 12),
+}
+
+
+def _best_of_two(shield, text):
+    timings = []
+    for _ in range(2):
+        started = time.perf_counter()
+        shield.check(text)
+        timings.append(time.perf_counter() - started)
+    return min(timings)
+
+
+@pytest.mark.parametrize("shape", list(SCALING_SHAPES))
+def test_scanning_scales_linearly_with_long_tokens(english, shape):
+    # Context lookups used to rescan the whole token or word per candidate
+    # match: "a55" * 2000 took ~4.5s and "shit" * 4000 ~33s. Quadrupling the
+    # input must now roughly quadruple the time (quadratic would be 16x).
+    make = SCALING_SHAPES[shape]
+    small = _best_of_two(english, make(500))
+    large = _best_of_two(english, make(2000))
+    assert large < 5.0, (shape, large)
+    assert large / max(small, 0.02) < 9, (shape, small, large)

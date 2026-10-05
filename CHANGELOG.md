@@ -21,6 +21,10 @@
 ### Fixes
 
 - Fixed catastrophic regex backtracking: `check("*" * 22)` took ~29s and `"*" * 24` never finished. Matching is now linear in the input length: 500-character adversarial inputs built from every bundled separator and substitution character finish in well under a second in every language. Very long runs of one character are shortened for matching only (masks still cover the whole run); a letter inside a word matches at most 64 mixed variants (`uüuü...`) or 32 censoring stretches (`f*f*f*...`) in a row.
+- Scanning long tokens was quadratic (`"a55" * 2000` took ~4.5s, `"shit" * 4000` ~33s): word, hex-token and letter contexts are now looked up in run indexes built once per check, overlap checks use bisect, and masking no longer copies the position map per match.
+- Inflections are handled completely: `shittier`, `crappier` and `crappiest` were no longer caught; the y -> i endings (`-ies/-ied/-ier/-iest/-ily/-iness`) now count after a doubled consonant or when the y-adjective is a dictionary word.
+- Obfuscated plurals across punctuation (`f, u, c, kheads`, `sh, itheads`) are caught again, without reintroducing `shit, s|ing` bleed.
+- The compound-word guard judges the actual occurrence instead of the first one in the word (`shitxshithell` masked only `hell`).
 - Repeated letters split by separators (`coo-on`, `pimm-mel`, `cell*lule`) are caught again, and `butt today` no longer loses its match to the following word.
 - Block words long enough to need more than 99 regex groups (for example a 101-character word) matched nothing.
 - Runs of a one-character block word (`"💩" * 8`) produced overlapping matches; with a callback mask, text after the run was deleted.

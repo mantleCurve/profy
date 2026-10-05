@@ -151,13 +151,14 @@ class ProfanityFilter:
         normalized, normalized_map = self.dictionary.normalize_with_mapping(text, text_map)
         normalized, normalized_map = _collapse_whitespace_with_mapping(normalized, normalized_map)
         # A run of one character longer than any dictionary word needs
-        # ("fuuuuuuuuu...ck", "*" * 1000) is shortened for matching only; the kept
-        # characters map back to the whole original run, so masks still cover it.
-        normalized, normalized_map = _replace_with_mapping(
+        # ("fuuuuuuuuu...ck", "*" * 1000) is shortened for matching only; the
+        # last kept character maps to the rest of the original run, so masks
+        # still cover it.
+        normalized, normalized_map = _shorten_runs_with_mapping(
             normalized,
             normalized_map,
             self.dictionary.long_run_pattern,
-            lambda match: match.group(0)[: self.dictionary.longest_run],
+            self.dictionary.longest_run,
         )
         immutable_normalized = normalized
         expressions = self.dictionary.sorted_expressions
@@ -222,6 +223,14 @@ class ProfanityFilter:
                         continue
 
                     original_start, original_end = _original_span(working_map, start, end)
+                    # Masks are applied to the original text, so two matches must
+                    # never claim the same original characters (several normalized
+                    # characters can come from one original character).
+                    if any(
+                        original_start < match.position + match.length and original_end > match.position
+                        for match in matches
+                    ):
+                        continue
                     original_length = original_end - original_start
                     matches.append(
                         Match(
@@ -602,9 +611,11 @@ def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
     groups = 0
 
     def atomic(body: str) -> str:
+        # Named groups: a numbered backreference past \99 would be read as an
+        # octal escape, breaking long (block-list) words.
         nonlocal groups
         groups += 1
-        return f"(?=({body}))(?:\\{groups})"
+        return f"(?=(?P<r{groups}>{body}))(?P=r{groups})"
 
     for index, token in enumerate(tokens):
         if token.literal is not None:
@@ -638,6 +649,11 @@ def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
                     repeats = f"(?:(?:{lead})?{own}){{1,{_RUN_STEP_LIMIT}}}"
                 else:
                     repeats = f"(?:{lead})?{own_run}(?:{lead}{own_run}){{0,{_RUN_STEP_LIMIT - 1}}}"
+            # Every repeat could equally start the next letter ("ss" in "ass"),
+            # so such a run keeps one character and leaves the rest to the next
+            # -- unless a separator splits the run ("coo-on", "pimm-mel"): then it
+            # keeps everything up to that separator.
+            split_run = "" if own else _split_run_expression(token, shared, separators, follow_chars)
             if index == 0 and not token.multi:
                 # The very first character stays a plain class so the regex
                 # engine can skip ahead to candidate positions.
@@ -646,10 +662,10 @@ def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
                     run += atomic(f"{own}*")
                 elif repeats:
                     run += atomic(f"(?:{repeats})?")
+                elif split_run:
+                    run += atomic(split_run)
             elif not own:
-                # Every repeat could equally start the next letter ("ss" in "ass"),
-                # so this run keeps one character and leaves the rest to the next.
-                run = atomic(shared) if token.multi else shared
+                run = (atomic(shared) if token.multi else shared) + (atomic(split_run) if split_run else "")
             else:
                 run = atomic(f"{repeats}|{shared}" if shared else repeats)
             piece = run + _gap_expression(separators, follow_chars)
@@ -717,7 +733,23 @@ def _start_guard(token: _Token, own: str, follow_chars: frozenset) -> str:
     return f"(?<!{own}{current})"
 
 
-def _gap_expression(separators: Iterable[str], follow_chars: frozenset) -> str:
+def _split_run_expression(token: _Token, shared: str, separators: Iterable[str], follow_chars: frozenset) -> str:
+    """Further characters of a run the next letter shares completely, ending in
+    separators -- taken only when one of the next letter's own (non-separator)
+    characters follows them ("coo-on", "pimm-mel", "cell*lule")."""
+    letters = _class_members(character for character in follow_chars if character not in separators)
+    if not letters:
+        return ""
+    following = "[" + "".join(letters) + "]"
+    limit = _RUN_STEP_LIMIT if token.multi else _RUN_LENGTH_LIMIT
+    # Whitespace splits a run only when the letter repeats after it too
+    # ("koo oon"); "butt today" must stay "butt" + "today", not "but|tt t|oday".
+    symbols = _gap_expression(separators, frozenset(" "), minimum=1)
+    spaced = _gap_expression(separators, frozenset(), minimum=1)
+    return f"(?:{shared}{{0,{limit}}}(?:{symbols}(?={following})|{spaced}(?={following}{{2}})))?"
+
+
+def _gap_expression(separators: Iterable[str], follow_chars: frozenset, minimum: int = 0) -> str:
     # Up to three separators between letters, as in Blasp; a "." only counts when
     # a word character follows it. Separators the next letter can start with
     # ("*", "@", "!", ...) are left to that letter.
@@ -732,7 +764,7 @@ def _gap_expression(separators: Iterable[str], follow_chars: frozenset) -> str:
         options.append(r"\.(?=\w)")
     if not options:
         return ""
-    return "(?:" + "|".join(options) + f"){{0,{_SEPARATOR_LIMIT}}}"
+    return "(?:" + "|".join(options) + f"){{{minimum},{_SEPARATOR_LIMIT}}}"
 
 
 def _options_expression(chars: Iterable[str], multi: Iterable[str]) -> str:
@@ -810,15 +842,29 @@ def _is_spanning_word_boundary(matched: str, full_text: str, start: int) -> bool
 
     if embedded_start and embedded_end:
         return True
+    if (embedded_start or embedded_end) and _PHRASE_BREAK.search(matched):
+        # Punctuation touching the whitespace ends a phrase ("shit, said",
+        # "fuck, yourself"): the match would run into the next word ("shits",
+        # "fuckyou"), so it is rejected and the profanity alone matches instead.
+        return True
     if embedded_start and not embedded_end:
-        return not _has_letter_and_nonletter(" ".join(parts[1:]))
+        return not _has_letter_and_nonletter(parts[1:])
     if not embedded_start and embedded_end:
-        return not _has_letter_and_nonletter(" ".join(parts[:-1]))
+        # The match may only stop short of the next word's end by an inflection
+        # ("@ss hole|s"), not part-way through another word ("f*ck you|rself").
+        rest = re.match(r"\w*", full_text[end:]).group(0).lower()
+        return rest not in _INFLECTION_SUFFIXES or not _has_letter_and_nonletter(parts[:-1])
     return False
 
 
-def _has_letter_and_nonletter(text: str) -> bool:
-    return bool(re.search(r"[a-z]", text, re.I)) and bool(re.search(r"[^a-z\s]", text, re.I))
+_PHRASE_BREAK = re.compile(r"[,.;:?!]\s|\s[,.;:?!]")
+_INFLECTION_SUFFIXES = ("s", "es", "ed", "er", "ers", "est", "ing", "ings", "ly", "y")
+
+
+def _has_letter_and_nonletter(parts: list[str]) -> bool:
+    # Obfuscation evidence is a word mixing letters and symbols ("@ss", "f*ck");
+    # a lone separator between words ("fuck - yourself") is not.
+    return any(re.search(r"[a-z]", part, re.I) and re.search(r"[^a-z]", part, re.I) for part in parts)
 
 
 def _full_word_context(text: str, start: int, length: int) -> str:
@@ -854,6 +900,12 @@ def _alpha_word_context(text: str, start: int, length: int) -> str:
 # Three identical letters in a row never occur in ordinary English spelling, so
 # they mark a deliberately stretched word ("fuuuck", "shiiiit").
 _STRETCHED_LETTERS = re.compile(r"(.)\1\1")
+# Letters English almost never doubles, so a doubled one is deliberate stretching
+# too ("fuuckin", "shiit"). Derived from /usr/share/dict/words (234k words): each
+# of these is doubled in under 0.5% of the words containing it (x 0%, y 0.008%,
+# q 0.03%, u 0.04%, v 0.06%, j 0.07%, a 0.09%, h 0.13%, i 0.29%, w 0.43%,
+# k 0.48%); the next letter, d, is doubled in 1.7% and s, l, f, o in 4-13%.
+_RARELY_DOUBLED = re.compile(r"([ahijkquvwxy])\1", re.IGNORECASE)
 
 
 def _squeeze(text: str) -> str:
@@ -882,6 +934,14 @@ def _is_pure_alpha_substring(
         # as if the repetition were not there.
         if _STRETCHED_LETTERS.search(match_lower):
             return False
+        # A rarely doubled letter is deliberate when the match is the word itself
+        # ("fuuckin", "shiits"); inside a longer word it is real spelling
+        # ("va|cuum", "an|giit|is").
+        rest = word_lower.replace(match_lower, "", 1)
+        if (not rest or rest in _INFLECTION_SUFFIXES) and any(
+            double.group(0) not in base_lower for double in _RARELY_DOUBLED.finditer(match_lower)
+        ):
+            return False
         if base_lower not in match_lower:
             return True
         at = word_lower.find(match_lower)
@@ -891,15 +951,21 @@ def _is_pure_alpha_substring(
     if len(word_lower) <= len(match_lower) or len(match_lower) > len(base_lower):
         return False
 
-    for suffix in ("s", "es", "ed", "er", "ers", "est", "ing", "ings", "ly", "y"):
+    for suffix in _INFLECTION_SUFFIXES:
         if word_lower == match_lower + suffix:
             return False
 
+    # A compound of profanities ("hellfuck", "dumbass") is not a clean word: the
+    # match stays flagged when another profanity directly abuts it. Profanities
+    # merely contained somewhere in the rest of the word ("ero" in "zerowidth")
+    # are ordinary letters and do not count.
     pos = word_lower.find(match_lower)
     if pos >= 0:
-        remainder = word_lower[:pos] + word_lower[pos + len(match_lower) :]
+        before = word_lower[:pos]
+        after = word_lower[pos + len(match_lower) :]
         for profanity in profanities:
-            if len(profanity) >= 3 and profanity.lower() in remainder:
+            lowered = profanity.lower()
+            if len(lowered) >= 3 and (before.endswith(lowered) or after.startswith(lowered)):
                 return False
     return True
 
@@ -1023,6 +1089,26 @@ def _replace_with_mapping(
         mapped.extend((original_start, original_end) for _ in replacement_text)
         cursor = end
 
+    pieces.append(text[cursor:])
+    mapped.extend(span_map[cursor:])
+    return "".join(pieces), mapped
+
+
+def _shorten_runs_with_mapping(
+    text: str,
+    span_map: list[tuple[int, int]],
+    pattern: str,
+    keep: int,
+) -> tuple[str, list[tuple[int, int]]]:
+    pieces: list[str] = []
+    mapped: list[tuple[int, int]] = []
+    cursor = 0
+    for match in re.finditer(pattern, text):
+        start, end = match.span()
+        pieces.append(text[cursor : start + keep])
+        mapped.extend(span_map[cursor : start + keep - 1])
+        mapped.append((span_map[start + keep - 1][0], span_map[end - 1][1]))
+        cursor = end
     pieces.append(text[cursor:])
     mapped.extend(span_map[cursor:])
     return "".join(pieces), mapped

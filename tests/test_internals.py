@@ -88,6 +88,14 @@ def test_multi_character_letters_in_every_position():
     assert expressions["kk"].fullmatch("**")
 
 
+def test_letters_made_only_of_separators():
+    # No real letter can follow, so a separator can never split the run.
+    expressions = core._generate_expressions(["xx", "xxa"], ["*", "!"], {"/x/": ["*", "!"], "/a/": ["a"]})
+    assert expressions["xx"].fullmatch("*!")
+    assert expressions["xxa"].fullmatch("**a")
+    assert core._split_run_expression(core._Token(frozenset("*!"), ()), "[!*]", ["*", "!"], frozenset("*!")) == ""
+
+
 def test_gap_expression_edge_cases():
     assert core._gap_expression([], frozenset({" ", "."})) == ""
     assert core._gap_expression(["-"], frozenset({"."})) == r"(?:[\s\-]){0,3}"
@@ -116,7 +124,11 @@ def test_spanning_word_boundary_helper():
     assert core._is_spanning_word_boundary("sh it", "xsh it", 1)
     assert core._is_spanning_word_boundary("sh it", "xsh itx", 1)
     assert not core._is_spanning_word_boundary("s h i t", "s h i t", 0)
-    assert not core._is_spanning_word_boundary("f*ck it", "f*ck itx", 0)
+    assert not core._is_spanning_word_boundary("f*ck it", "f*ck its", 0)
+    assert core._is_spanning_word_boundary("f*ck it", "f*ck itx", 0)
+    assert core._is_spanning_word_boundary("fuck - you", "fuck - yourself", 0)
+    assert core._is_spanning_word_boundary("shit, s", "shit, said", 0)
+    assert core._is_spanning_word_boundary("t, shit", "it, shit", 1)
     assert not core._is_spanning_word_boundary("sh it", "sh it", 0)
     assert not core._is_spanning_word_boundary("shit", "shit", 0)
     assert filter_text("sh itx").is_clean
@@ -137,6 +149,15 @@ def test_spanning_word_boundary_helper():
         ("cooook", "cooook", "cok", [], False),
         ("anall", "anally", "anal", [], False),
         ("ccum", "accumulate", "cum", [], True),
+        ("dth", "zerowidth", "deth", ["ero"], True),
+        ("tard", "astards", "tard", ["ass"], True),
+        ("shit", "xshitfuck", "shit", ["fuck"], False),
+        ("fuck", "dumbassfuck", "fuck", ["ass"], False),
+        ("cuum", "vacuum", "cum", [], True),
+        ("shiit", "shiit", "shit", [], False),
+        ("shiit", "shiits", "shit", [], False),
+        ("fuuck", "fuuckx", "fuck", [], True),
+        ("fuuck", "fuuck", "fuuck", [], False),
         ("fuuck", "fuuck", "fuuck", [], False),
         ("fck", "fcks", "fuck", [], False),
     ],
@@ -182,3 +203,23 @@ def test_longest_needed_run():
     assert core._longest_needed_run(["booooooobs"], {}) == 7
     assert core._longest_needed_run(["gilipollas"], {"/ll/": ["ll", "y"], "/x/": ["ks"]}) == 4
     assert ProfanityFilter(languages="spanish").dictionary.long_run_pattern == r"(.)\1{4,}"
+
+
+def test_matches_never_share_original_characters():
+    # Defensive invariant: even if two expressions match neighbouring normalized
+    # characters that come from one original character, only one match is kept.
+    # German normalizes "\u00e4" to "ae": "!a" and "e#" share the original "\u00e4".
+    shield = _with_extra_expressions(
+        ProfanityFilter(languages="german", block=["zz-overlap"]),
+        ("zz-a", re.compile("!a")),
+        ("zz-e", re.compile("e#")),
+    )
+    result = _within(30, shield.check, "!\u00e4#")
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-a", 0, 2)]
+    assert result.clean == "**#"
+
+
+def test_shorten_runs_with_mapping():
+    text, span_map = core._shorten_runs_with_mapping("xaaaaay", [(i, i + 1) for i in range(7)], r"(.)\1{3,}", 3)
+    assert text == "xaaay"
+    assert span_map == [(0, 1), (1, 2), (2, 3), (3, 6), (6, 7)]

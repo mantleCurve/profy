@@ -233,6 +233,38 @@ def test_pattern_driver_filters_severity_before_deduplication():
     assert filter_text("damn", driver="pattern", minimum_severity="high").is_clean
 
 
+def test_pattern_driver_filters_severity_before_deduplicating_overlaps():
+    # "hi coon" (high) overlaps "coon" (extreme); filtering after de-duplication
+    # would drop the longer match first and lose the extreme one.
+    result = filter_text("hi coon", driver="pattern", block=["hi coon"], minimum_severity="extreme")
+    assert result.clean == "hi ****"
+    assert [match.base for match in result.matches] == ["coon"]
+
+
+def test_long_block_words_match():
+    # Generated expressions use more than 99 groups for long words; numbered
+    # backreferences past \99 would be read as octal escapes.
+    for word in ["ab" * 50 + "a", "x" * 300, "abcdefghij" * 20]:
+        result = filter_text(f"say {word} now", block=[word])
+        assert result.clean == f"say {'*' * len(word)} now"
+        assert result.matches[0].base == word
+
+
+def test_runs_of_a_single_character_block_word_never_overlap():
+    poo = "\U0001F4A9"
+    result = filter_text(poo * 8 + " hello", block=[poo], mask=lambda word, length: "X")
+    assert result.clean.endswith(" hello")
+    assert result.original == poo * 8 + " hello"
+    spans = [(match.position, match.position + match.length) for match in result.matches]
+    assert spans == sorted(spans)
+    assert all(end <= start for (_, end), (start, _) in zip(spans, spans[1:]))
+    assert spans[0][0] == 0 and spans[-1][1] == 8
+    assert result.unique_words == [poo]
+    assert result.count == len(result.clean) - len(" hello")
+    assert filter_text(poo * 8 + " hello", block=[poo]).clean == "*" * 8 + " hello"
+    assert filter_text(poo * 3, block=[poo]).count == 3
+
+
 def test_pattern_driver_respects_allow_block_and_false_positives():
     assert filter_text("ship", driver="pattern", block=["ship"]).clean == "****"
     assert filter_text("shit", driver="pattern", allow=["shit"]).is_clean

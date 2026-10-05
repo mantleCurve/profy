@@ -95,6 +95,76 @@ def test_ordinary_double_letters_do_not_manufacture_profanity(english, text):
 
 
 @pytest.mark.parametrize(
+    "text",
+    ["fuuckin", "fuucking", "shiit", "shiits", "shiiter", "biitch", "puussy", "diick", "cuunt", "twaat", "FUUCK", "f-uuckin"],
+)
+def test_doubled_rarely_doubled_letters_are_deliberate(english, text):
+    # English almost never doubles a, h, i, j, k, q, u, v, w, x or y.
+    assert english.check(text).clean == "*" * len(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cook", "book", "look", "coffee", "cookie", "good", "skiing", "vacuum", "vacuums", "continuum",
+        "angiitis", "Shiite", "Shiites", "taxiing", "bazaar", "zero\u200bwidth", "zerowidth", "herowidth",
+    ],
+)
+def test_words_with_real_double_letters_stay_clean(english, text):
+    assert english.check(text).clean == text
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
+        ("shit, said the man", "****, said the man"),
+        ("Shit, sorry", "****, sorry"),
+        ("sh!t, said", "****, said"),
+        ("fuck, yourself", "****, yourself"),
+        ("fuck - yourself", "**** - yourself"),
+        ("f*ck yourself", "**** yourself"),
+        ("shit ; sorry", "**** ; sorry"),
+        ("you are such a butt today", "you are such a **** today"),
+        ("butt today", "**** today"),
+        # Deliberate separator obfuscation still spans spaces and punctuation.
+        ("f u c k", "*******"),
+        ("f, u, c, k", "**********"),
+        ("f u c king", "**********"),
+        ("@ss holes", "*********"),
+        ("a$$ hats", "*******s"),
+        ("fuck - you", "**********"),
+        ("fuck, you", "*********"),
+    ],
+)
+def test_matches_do_not_bleed_into_the_next_word(english, text, clean):
+    result = english.check(text)
+    assert result.clean == clean
+    for match in result.matches:
+        assert match.text == text[match.position : match.position + match.length]
+
+
+@pytest.mark.parametrize(
+    "text, options, clean",
+    [
+        ("coo-on", {}, "******"),
+        ("coo*on", {}, "******"),
+        ("coo--on", {}, "*******"),
+        ("cooo-on", {}, "*******"),
+        ("coo-n", {}, "*****"),
+        ("koo oon", {}, "*******"),
+        ("a-ss", {}, "****"),
+        ("as-s", {}, "****"),
+        ("shitt-ed", {}, "********"),
+        ("pimm-mel", {"languages": "german"}, "********"),
+        ("pimm*mel", {"languages": "german"}, "********"),
+        ("cell*lule", {"languages": "french"}, "*********"),
+    ],
+)
+def test_repeated_letters_split_by_separators(text, options, clean):
+    assert filter_text(text, **options).clean == clean
+
+
+@pytest.mark.parametrize(
     "text, clean",
     [
         ("fuuuck", "******"),

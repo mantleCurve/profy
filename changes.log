@@ -1,5 +1,28 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening, round 2 + Codex review pass 1)
+- Doubled letters: `_RARELY_DOUBLED` (a h i j k q u v w x y; each doubled in
+  <0.5% of /usr/share/dict/words entries containing it, next letter d at 1.7%)
+  marks deliberate stretching when the match is the whole word or the word plus
+  an inflection, so `fuuckin`/`shiit` are caught while `vacuum` stays clean.
+  Added `shiite`/`shiites` to global false positives.
+- Match bleed: `_is_spanning_word_boundary` rejects matches that run into the
+  next word across phrase punctuation (`shit, s|aid`), counts only tokens
+  mixing letters and symbols as obfuscation (`fuck - you|rself`), and lets a
+  match stop inside the next word only before an inflection (`@ss hole|s`).
+- Compound rule in `_is_pure_alpha_substring`: another profanity must abut the
+  match (`hell|fuck`); `ero` anywhere in `zerowi` no longer disables the
+  Scunthorpe guard for `dth` in `zero\u200bwidth`.
+- Dictionary scan: 2355 (original) -> 1318 (round 1) -> 830 flagged; newly
+  flagged vs round 1: bastaard, naziism.
+- Codex P1: identical adjacent letters may keep a run split by separators
+  (`coo-on`, `pimm-mel`, `cell*lule`; space only if the letter repeats after it).
+- Codex P2: run shortening keeps per-character spans and matches never share
+  original characters (`"💩"*8` with a callback mask deleted the rest of the text).
+- Codex P2: named groups/backreferences (`\100` was parsed as octal, so block
+  words needing >99 groups never matched).
+- Codex P3: overlapping-severity test for the pattern driver.
+
 ## 2026-10-06 (fix/codex-review-hardening)
 - ReDoS: rewrote expression generation in `profy/core.py` (`_tokens_expression`
   and helpers). Each letter run is committed through an atomic group emulated

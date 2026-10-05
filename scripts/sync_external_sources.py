@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge external profanity wordlists into profy/data/languages/english.json.
+"""Refresh the external English word-list layer and re-assemble the bundle.
 
 Sources (fetched fresh on each run):
   - jojoee/leo-profanity            (MIT)
@@ -7,9 +7,13 @@ Sources (fetched fresh on each run):
   - web-mech/badwords-list          (MIT)
   - LDNOOBW/List-of-...-Bad-Words   (CC-BY-4.0)
 
-Words land in the `profanities` array, which defaults to Severity.HIGH per
-profy.core._build_severity_map. Words already classified in the `severity`
-buckets keep their existing severity (mild/moderate/extreme are not overwritten).
+The normalized candidates of each source are stored in
+``sources/external/english.json``; ``scripts/wordlist_layers.py`` then appends
+the ones that are new to the upstream English word lists, in source order, to
+``profy/data/languages/english.json``. New words default to Severity.HIGH per
+profy.core._build_severity_map; words already classified in the upstream
+`severity` buckets keep their severity, and false positives and mere suffix
+variants of known words are skipped.
 """
 
 from __future__ import annotations
@@ -17,11 +21,12 @@ from __future__ import annotations
 import json
 import re
 import sys
+import urllib.error
 import urllib.request
-from pathlib import Path
+import wordlist_layers as layers
 
-ROOT = Path(__file__).resolve().parents[1]
-ENGLISH_PATH = ROOT / "profy" / "data" / "languages" / "english.json"
+ROOT = layers.ROOT
+LANGUAGE = "english"
 
 SOURCES = {
     "leo-profanity": "https://raw.githubusercontent.com/jojoee/leo-profanity/master/dictionary/default.json",
@@ -73,73 +78,53 @@ def normalize(word: str) -> str | None:
     return word
 
 
-SUFFIX_VARIANTS = ("s", "es", "ed", "er", "ers", "ly", "y", "ing", "ings")
-
-
-def is_redundant_suffix_variant(word: str, index: set[str]) -> bool:
-    """Skip imports like 'fuckings' when 'fucking' is already classified.
-
-    These add no signal and trigger boundary-bleed false positives because
-    the trailing `s+` can attach to the next word's leading `s`.
-    """
-    for suffix in SUFFIX_VARIANTS:
-        if word.endswith(suffix) and len(word) > len(suffix) + 2:
-            stem = word[: -len(suffix)]
-            if stem in index:
-                return True
-    return False
-
-
-def main() -> int:
-    existing = json.loads(ENGLISH_PATH.read_text(encoding="utf-8"))
-    profanities: list[str] = list(existing.get("profanities", []))
-    false_positives = {w.lower() for w in existing.get("false_positives", [])}
-    existing_index = {w.lower() for w in profanities}
-    for bucket in existing.get("severity", {}).values():
-        existing_index.update(w.lower() for w in bucket)
-
-    per_source_counts: dict[str, int] = {}
-    skipped: dict[str, int] = {}
-
+def collect() -> tuple[dict, dict[str, int]]:
+    """Fetch every source before anything is written, so a failed download
+    leaves the layer and the bundle untouched."""
+    layer: dict = {"sources": {}}
+    dropped: dict[str, int] = {}
     for name, url in SOURCES.items():
         print(f"[fetch] {name} <- {url}", file=sys.stderr)
-        raw = fetch(url)
-        candidates = PARSERS[name](raw)
-        added = 0
-        dropped = 0
+        try:
+            candidates = PARSERS[name](fetch(url))
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            raise SystemExit(f"failed to fetch {name} from {url}: {error}") from error
+        words: dict[str, None] = {}
+        dropped[name] = 0
         for candidate in candidates:
             normalized = normalize(candidate)
             if normalized is None:
-                dropped += 1
-                continue
-            if normalized in false_positives:
-                dropped += 1
-                continue
-            if normalized in existing_index:
-                continue
-            if is_redundant_suffix_variant(normalized, existing_index):
-                dropped += 1
-                continue
-            profanities.append(normalized)
-            existing_index.add(normalized)
-            added += 1
-        per_source_counts[name] = added
-        skipped[name] = dropped
-        print(f"[merge] {name}: +{added} new, dropped {dropped}", file=sys.stderr)
+                dropped[name] += 1
+            else:
+                words.setdefault(normalized, None)
+        layer["sources"][name] = {"url": url, "words": list(words)}
+    return layer, dropped
 
-    existing["profanities"] = profanities
 
-    ENGLISH_PATH.write_text(
-        json.dumps(existing, indent=4, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+def main() -> int:
+    upstream_path = layers.upstream_dir(ROOT) / f"{LANGUAGE}.json"
+    if not upstream_path.is_file():
+        raise SystemExit(f"{upstream_path.relative_to(ROOT)} is missing; run scripts/sync_from_blasp.py first")
+    layer, dropped = collect()
+    layers.write_if_changed(layers.external_dir(ROOT) / f"{LANGUAGE}.json", layers.dumps(layer))
+    changed = layers.assemble(ROOT)
+
+    upstream = layers.read_json(upstream_path)
+    merged, added = layers.merge_external(
+        upstream.get("profanities", []),
+        upstream.get("false_positives", []),
+        upstream.get("severity", {}),
+        layers.external_sources(layer),
     )
+    for name in SOURCES:
+        print(f"[merge] {name}: +{added[name]} new, dropped {dropped[name]}", file=sys.stderr)
     print(
-        f"[done] total profanities now: {len(profanities)} "
-        f"(added: {sum(per_source_counts.values())})",
+        f"[done] total profanities now: {len(merged)} "
+        f"(added: {sum(added.values())}; bundle {'updated' if changed else 'unchanged'})",
         file=sys.stderr,
     )
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - exercised through main()
     raise SystemExit(main())

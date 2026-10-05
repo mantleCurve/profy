@@ -1,5 +1,47 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening)
+- ReDoS: rewrote expression generation in `profy/core.py` (`_tokens_expression`
+  and helpers). Each letter run is committed through an atomic group emulated
+  with `(?=(...))\N` (Python 3.9 compatible), shared characters such as `*`
+  stay in a run only when one of its own letters follows, gaps only take
+  separators the next letter cannot start with, a start guard skips positions
+  inside the first letter's run, inner runs are bounded (64 chars / 32 steps)
+  and runs of one character longer than any dictionary word needs are
+  shortened for matching only (span-mapped). `"*" * 22` went from ~29s to
+  ~2ms; scans are linear in input length (500-char adversarial inputs from
+  every bundled separator/substitution character: worst ~0.3s with all
+  languages). Differential run against the previous engine over ~25k
+  generated obfuscations: detection identical except 6 exotic
+  multi-separator forms. Compiled expressions are cached per profanity.
+- Scan loop never accepts zero-length matches; blank allow/block entries are
+  ignored (fixes `filter_text("!", block=[""])` hanging).
+- Combined-language dictionaries merge only accent/diacritic substitutions
+  (port of Blasp `Dictionary::forLanguages`), fixing "sock" in english+german.
+- Block list keeps existing severities (Blasp semantics), overrides bundled
+  false positives for the exact word; allow still wins over block.
+- Unknown/empty language selections raise `ValueError`.
+- Repetition expansion: `_is_pure_alpha_substring` protects matches that only
+  exist through ordinary double letters (cook/cookie/good); 3+ repeated
+  letters remain deliberate. /usr/share/dict/words scan (234,456 words):
+  2355 flagged before, 1318 after, 0 newly flagged.
+- Added `driver="pattern"` (port of Blasp `PatternDriver`).
+- Invisible characters are stripped only for matching with a span map back to
+  the input; `original` is the exact input and `clean` only masks matches.
+- One-shot helpers use a bounded `lru_cache` of compiled dictionaries;
+  expressions are pre-sorted once per dictionary.
+- Sync tooling: `sync_from_blasp.py` pulls only per-language word lists into
+  `sources/upstream/`, `sync_external_sources.py` stores normalized source
+  candidates in `sources/external/`, and the new `scripts/wordlist_layers.py`
+  assembles `profy/data/languages/*.json` (byte-identical to the previous
+  bundle: english 2663 profanities). Removed PHP implementation hashing;
+  metadata/report only change with upstream; added `--check`.
+- Release workflow: version consistency check, derived prerelease flag, wheel
+  smoke test in a clean venv, publish only on tags, no skip-existing.
+- CI: Python 3.14 added; tests reorganized (test_detection, test_options,
+  test_unicode, test_redos, test_internals, test_sync_scripts) with 100% line
+  and branch coverage enforced via pytest-cov.
+
 ## 2026-06-26 - Release 0.1.2
 - Bumped version 0.1.1 -> 0.1.2 (pyproject.toml, profy/__init__.py, version test).
 - Updated CHANGELOG.md with the 0.1.2 substring/digit false-positive fix.

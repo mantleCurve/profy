@@ -3,16 +3,17 @@
 - Upstream: `https://github.com/Blaspsoft/blasp.git`
 - Current commit: `cce2dd02e0cdad5c504d18d554322098d4ee2c28`
 - Previous synced commit: `cce2dd02e0cdad5c504d18d554322098d4ee2c28`
-- Synced at: `2026-06-26T16:55:37.642019+00:00`
+- Synced at: `2026-10-05T19:54:37.259349+00:00`
 
-## Exported Data
+Only the per-language word lists (`profanities`, `false_positives`, `severity`) are
+synced from upstream. Separators, substitutions, global false positives and the
+matching engine are Profy-owned.
 
-- `profy/data/global.json`
-- `profy/data/languages/english.json`
-- `profy/data/languages/french.json`
-- `profy/data/languages/german.json`
-- `profy/data/languages/spanish.json`
+## Exported Word Lists
 
-## PHP Implementation Changes
-
-No tracked PHP implementation files changed since the previous sync.
+| Language | Profanities | False positives | Severity-classified |
+| --- | ---: | ---: | ---: |
+| english | 1314 | 257 | 119 |
+| french | 1494 | 492 | 114 |
+| german | 1025 | 554 | 88 |
+| spanish | 389 | 384 | 91 |

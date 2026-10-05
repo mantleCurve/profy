@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-'''Sync Profy's bundled data from the upstream Blasp PHP repository.
+'''Sync Profy's upstream word lists from the Blaspsoft/blasp PHP repository.
 
-The script fetches or reads Blaspsoft/blasp, exports PHP config arrays to JSON,
-updates profy/data, and writes a report that flags upstream PHP implementation
-changes for manual port review.
+Only the per-language word lists are pulled from ``config/languages/*.php``:
+``profanities``, ``false_positives`` and the ``severity`` buckets. Everything
+else -- separators, substitutions, global false positives and the matching
+engine itself -- is Profy-owned and edited locally.
+
+The export is written to ``sources/upstream/<language>.json`` and the shipped
+bundle in ``profy/data/languages`` is re-assembled from the word-list layers
+(see ``scripts/wordlist_layers.py``). ``profy/data/upstream.json`` and
+``docs/upstream-sync-report.md`` are rewritten only when the upstream commit or
+the exported word lists change, so a no-op sync leaves the tree untouched.
+Pass ``--check`` to exit 1 when a sync would change anything, writing nothing.
 '''
 
 from __future__ import annotations
@@ -15,39 +23,68 @@ from pathlib import Path
 import shutil
 import subprocess
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Mapping, Optional, Sequence
 
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_DATA = ROOT / "profy" / "data"
-REPORT_PATH = ROOT / "docs" / "upstream-sync-report.md"
-METADATA_PATH = PACKAGE_DATA / "upstream.json"
+import wordlist_layers as layers
+
+ROOT = layers.ROOT
 DEFAULT_UPSTREAM = "https://github.com/Blaspsoft/blasp.git"
-IMPLEMENTATION_GLOBS = [
-    "src/Core/**/*.php",
-    "src/Drivers/**/*.php",
-    "src/Enums/**/*.php",
-    "src/PendingCheck.php",
-    "config/blasp.php",
-]
+SEVERITY_LEVELS = ("mild", "moderate", "high", "extreme")
+
+EXPORT_PHP = r'''
+if (!function_exists('env')) {
+    function env(string $key, mixed $default = null): mixed {
+        $value = getenv($key);
+        return $value === false ? $default : $value;
+    }
+}
+$out = [];
+foreach (glob('config/languages/*.php') as $file) {
+    $data = require $file;
+    $lists = [];
+    foreach (['severity', 'profanities', 'false_positives'] as $key) {
+        if (is_array($data) && array_key_exists($key, $data)) {
+            $lists[$key] = $data[$key];
+        }
+    }
+    $out[basename($file, '.php')] = (object) $lists;
+}
+echo json_encode((object) $out, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+'''
+
+
+def metadata_path(root: Path) -> Path:
+    return root / "profy" / "data" / "upstream.json"
+
+
+def report_path(root: Path) -> Path:
+    return root / "docs" / "upstream-sync-report.md"
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def run(command: list[str], *, cwd: Optional[Path] = None) -> str:
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"`{command[0]}` failed ({error.returncode}): {error.stderr.strip()}") from error
     return completed.stdout.strip()
 
 
 def ensure_upstream(args: argparse.Namespace) -> Path:
     if args.source_dir:
         source = Path(args.source_dir).expanduser().resolve()
-        if not (source / "config" / "blasp.php").is_file():
-            raise SystemExit(f"{source} does not look like a Blasp checkout")
+        if not (source / "config" / "languages").is_dir():
+            raise SystemExit(f"{source} does not look like a Blasp checkout (no config/languages)")
         return source
 
     cache_dir = Path(args.cache_dir).expanduser().resolve()
@@ -64,54 +101,43 @@ def ensure_upstream(args: argparse.Namespace) -> Path:
     return cache_dir
 
 
-def php_json(upstream: Path, php_expression: str) -> str:
-    php = r'''
-if (!function_exists('env')) {
-    function env(string $key, mixed $default = null): mixed {
-        $value = getenv($key);
-        return $value === false ? $default : $value;
-    }
-}
-''' + php_expression
-    return run(["php", "-r", php], cwd=upstream) + "\n"
+def _string_list(value: object, what: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SystemExit(f"upstream {what} is not a list of strings")
+    return value
 
 
-def export_data(upstream: Path) -> list[Path]:
-    languages_dir = PACKAGE_DATA / "languages"
-    languages_dir.mkdir(parents=True, exist_ok=True)
+def clean_wordlists(language: str, data: object) -> dict:
+    """Validate one language's exported word lists into the layer format."""
+    if not isinstance(data, dict) or "profanities" not in data:
+        raise SystemExit(f"upstream language {language!r} has no profanities list")
+    lists: dict = {}
+    if "severity" in data:
+        severity = data["severity"]
+        # PHP encodes an empty associative array as a JSON list.
+        severity = {} if severity == [] else severity
+        if not isinstance(severity, dict):
+            raise SystemExit(f"upstream {language} severity is not a mapping")
+        unknown = sorted(set(severity) - set(SEVERITY_LEVELS))
+        if unknown:
+            raise SystemExit(
+                f"upstream {language} uses unknown severity level(s) {unknown}; "
+                "add them to profy.core.Severity before syncing"
+            )
+        lists["severity"] = {
+            level: _string_list(words, f"{language} severity.{level}") for level, words in severity.items()
+        }
+    lists["profanities"] = _string_list(data["profanities"], f"{language} profanities")
+    if "false_positives" in data:
+        lists["false_positives"] = _string_list(data["false_positives"], f"{language} false_positives")
+    return lists
 
-    written: list[Path] = []
-    global_json = php_json(
-        upstream,
-        r'''
-$global = require 'config/blasp.php';
-$out = [
-    'separators' => $global['separators'] ?? [],
-    'substitutions' => $global['substitutions'] ?? [],
-    'false_positives' => $global['false_positives'] ?? [],
-    'phonetic_false_positives' => $global['drivers']['phonetic']['false_positives'] ?? [],
-];
-echo json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-''',
-    )
-    global_path = PACKAGE_DATA / "global.json"
-    global_path.write_text(global_json, encoding="utf-8")
-    written.append(global_path)
 
-    for language_file in sorted((upstream / "config" / "languages").glob("*.php")):
-        language = language_file.stem
-        language_json = php_json(
-            upstream,
-            f'''
-$data = require 'config/languages/{language}.php';
-echo json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-''',
-        )
-        target = languages_dir / f"{language}.json"
-        target.write_text(language_json, encoding="utf-8")
-        written.append(target)
-
-    return written
+def export_wordlists(upstream: Path) -> dict[str, dict]:
+    exported = json.loads(run(["php", "-r", EXPORT_PHP], cwd=upstream))
+    if not exported:
+        raise SystemExit(f"no language files found under {upstream / 'config' / 'languages'}")
+    return {language: clean_wordlists(language, data) for language, data in sorted(exported.items())}
 
 
 def git_commit(upstream: Path) -> str:
@@ -121,102 +147,67 @@ def git_commit(upstream: Path) -> str:
 def git_remote(upstream: Path) -> str:
     try:
         return run(["git", "remote", "get-url", "origin"], cwd=upstream)
-    except subprocess.CalledProcessError:
+    except SystemExit:
         return str(upstream)
 
 
-def implementation_files(upstream: Path) -> dict[str, str]:
-    files: dict[str, str] = {}
-    for pattern in IMPLEMENTATION_GLOBS:
-        for path in sorted(upstream.glob(pattern)):
-            if path.is_file():
-                relative = path.relative_to(upstream).as_posix()
-                files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return files
-
-
-def load_previous() -> dict[str, object]:
-    if not METADATA_PATH.is_file():
+def load_previous(root: Path) -> dict:
+    path = metadata_path(root)
+    if not path.is_file():
         return {}
-    return json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def changed_files(previous: dict[str, object], current: dict[str, str]) -> list[str]:
-    old = previous.get("implementation_files")
-    if not isinstance(old, dict):
-        return []
-    changed: list[str] = []
-    for path, digest in current.items():
-        if old.get(path) != digest:
-            changed.append(path)
-    for path in old:
-        if path not in current:
-            changed.append(str(path))
-    return sorted(set(changed))
-
-
-def write_metadata(
-    *,
-    upstream_url: str,
-    commit: str,
-    implementation: dict[str, str],
-    data_files: Iterable[Path],
-) -> None:
-    metadata = {
+def build_metadata(*, upstream_url: str, commit: str, wordlists: Mapping[str, dict]) -> dict:
+    """Metadata without the timestamp, so it is a pure function of the sync input."""
+    files = {}
+    for language in sorted(wordlists):
+        path = (layers.upstream_dir(ROOT) / f"{language}.json").relative_to(ROOT).as_posix()
+        files[path] = hashlib.sha256(layers.dumps(wordlists[language]).encode("utf-8")).hexdigest()
+    return {
         "upstream": "Blaspsoft/blasp",
         "upstream_url": upstream_url,
         "commit": commit,
-        "synced_at": datetime.now(timezone.utc).isoformat(),
-        "data_files": [path.relative_to(ROOT).as_posix() for path in data_files],
-        "implementation_files": implementation,
+        "wordlist_files": files,
     }
-    METADATA_PATH.write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
 
 
-def write_report(
+def render_report(
     *,
-    upstream_url: str,
-    commit: str,
-    previous: dict[str, object],
-    changed: list[str],
-    data_files: Iterable[Path],
-) -> None:
-    previous_commit = previous.get("commit", "none")
+    metadata: Mapping[str, object],
+    previous: Mapping[str, object],
+    wordlists: Mapping[str, dict],
+    synced_at: str,
+) -> str:
     lines = [
         "# Upstream Blasp Sync Report",
         "",
-        f"- Upstream: `{upstream_url}`",
-        f"- Current commit: `{commit}`",
-        f"- Previous synced commit: `{previous_commit}`",
-        f"- Synced at: `{datetime.now(timezone.utc).isoformat()}`",
+        f"- Upstream: `{metadata['upstream_url']}`",
+        f"- Current commit: `{metadata['commit']}`",
+        f"- Previous synced commit: `{previous.get('commit', 'none')}`",
+        f"- Synced at: `{synced_at}`",
         "",
-        "## Exported Data",
+        "Only the per-language word lists (`profanities`, `false_positives`, `severity`) are",
+        "synced from upstream. Separators, substitutions, global false positives and the",
+        "matching engine are Profy-owned.",
         "",
+        "## Exported Word Lists",
+        "",
+        "| Language | Profanities | False positives | Severity-classified |",
+        "| --- | ---: | ---: | ---: |",
     ]
-    lines.extend(f"- `{path.relative_to(ROOT).as_posix()}`" for path in data_files)
-    lines.extend(["", "## PHP Implementation Changes", ""])
-
-    if not previous:
-        lines.append("No previous upstream metadata existed; this sync establishes the baseline.")
-    elif changed:
+    for language in sorted(wordlists):
+        lists = wordlists[language]
+        classified = sum(len(words) for words in lists.get("severity", {}).values())
         lines.append(
-            "The following upstream PHP implementation files changed. Review these "
-            "manually and port relevant behavior into `profy/core.py`:"
+            f"| {language} | {len(lists['profanities'])} | {len(lists.get('false_positives', []))} | {classified} |"
         )
-        lines.append("")
-        lines.extend(f"- `{path}`" for path in changed)
-    else:
-        lines.append("No tracked PHP implementation files changed since the previous sync.")
-
     lines.append("")
-    REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
+    return "\n".join(lines)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--upstream", default=DEFAULT_UPSTREAM, help="Blasp git URL")
     parser.add_argument("--ref", default="main", help="Git ref to sync")
     parser.add_argument(
@@ -228,44 +219,76 @@ def parse_args() -> argparse.Namespace:
         "--source-dir",
         help="Use an existing local Blasp checkout instead of cloning/fetching",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if a sync would change any file; write nothing",
+    )
+    return parser.parse_args(argv)
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     if not shutil.which("php"):
         raise SystemExit("php is required to export Blasp config arrays")
     if not shutil.which("git"):
         raise SystemExit("git is required to fetch upstream Blasp")
 
-    args = parse_args()
+    args = parse_args(argv)
+    check = args.check
     upstream = ensure_upstream(args)
-    previous = load_previous()
-    data_files = export_data(upstream)
-    implementation = implementation_files(upstream)
-    changed = changed_files(previous, implementation)
+    wordlists = export_wordlists(upstream)
     commit = git_commit(upstream)
     upstream_url = git_remote(upstream)
 
-    write_metadata(
-        upstream_url=upstream_url,
-        commit=commit,
-        implementation=implementation,
-        data_files=data_files,
-    )
-    write_report(
-        upstream_url=upstream_url,
-        commit=commit,
-        previous=previous,
-        changed=changed,
-        data_files=data_files,
-    )
+    changed: list[Path] = []
+    layer_dir = layers.upstream_dir(ROOT)
+    for language, lists in wordlists.items():
+        target = layer_dir / f"{language}.json"
+        if layers.write_if_changed(target, layers.dumps(lists), check=check):
+            changed.append(target)
+    for stale in sorted(layer_dir.glob("*.json")):
+        if stale.stem not in wordlists:
+            # The bundled file keeps its last word lists; drop it by hand if the
+            # language should go away too.
+            print(f"upstream no longer provides {stale.stem}; profy/data/languages/{stale.name} left as is")
+            changed.append(stale)
+            if not check:
+                stale.unlink()
+    changed.extend(layers.assemble(ROOT, check=check, upstream=wordlists))
 
-    print(f"Synced Blasp data from {commit}")
-    if changed:
-        print("Tracked PHP implementation changes need manual port review:")
-        for path in changed:
-            print(f"- {path}")
+    previous = load_previous(ROOT)
+    metadata = build_metadata(upstream_url=upstream_url, commit=commit, wordlists=wordlists)
+    previous_core = {key: value for key, value in previous.items() if key != "synced_at"}
+    if previous_core != metadata or not report_path(ROOT).is_file():
+        changed.append(metadata_path(ROOT))
+        if not check:
+            synced_at = utcnow()
+            metadata_path(ROOT).write_text(
+                json.dumps({**metadata, "synced_at": synced_at}, indent=2, ensure_ascii=False, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            report_path(ROOT).parent.mkdir(parents=True, exist_ok=True)
+            report_path(ROOT).write_text(
+                render_report(metadata=metadata, previous=previous, wordlists=wordlists, synced_at=synced_at),
+                encoding="utf-8",
+            )
+
+    relative = [path.relative_to(ROOT).as_posix() for path in changed]
+    if check:
+        if relative:
+            print(f"Upstream {commit} would change:")
+            print("\n".join(f"- {path}" for path in relative))
+            return 1
+        print(f"Up to date with upstream {commit}")
+        return 0
+    if relative:
+        print(f"Synced Blasp word lists from {commit}:")
+        print("\n".join(f"- {path}" for path in relative))
+    else:
+        print(f"Already up to date with upstream {commit}; nothing written")
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # pragma: no cover - exercised through main()
+    raise SystemExit(main())

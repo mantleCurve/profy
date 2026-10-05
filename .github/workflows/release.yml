@@ -1,5 +1,9 @@
 name: Release
 
+# Pushing a v* tag builds, verifies and publishes that version. A manual
+# workflow_dispatch run on a branch is a dry run: it tests, builds and
+# smoke-tests the distributions and uploads them as artifacts, but creates no
+# GitHub Release and publishes nothing to PyPI.
 on:
   workflow_dispatch:
   push:
@@ -19,9 +23,54 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade build pytest
-      - run: python -m pytest
+      - run: python -m pip install --upgrade build packaging
+      - id: version
+        name: Check tag, pyproject and package versions agree
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, re, sys, tomllib
+          from packaging.version import Version
+
+          project = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          package = re.search(r'^__version__ = "([^"]+)"', open("profy/__init__.py").read(), re.M).group(1)
+          errors = []
+          if package != project:
+              errors.append(f"profy.__version__ {package} != pyproject version {project}")
+          if os.environ["REF_TYPE"] == "tag":
+              tag = os.environ["REF_NAME"].removeprefix("v")
+              if tag != project:
+                  errors.append(f"tag {os.environ['REF_NAME']} != pyproject version {project}")
+          if errors:
+              sys.exit("\n".join(errors))
+          prerelease = Version(project).is_prerelease
+          print(f"Releasing {project} (prerelease: {prerelease})")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={project}\nprerelease={str(prerelease).lower()}\n")
+          PY
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest --cov --cov-report=term-missing
       - run: python -m build
+      - name: Smoke-test the built wheel in a clean virtualenv
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python -m venv /tmp/profy-release-venv
+          /tmp/profy-release-venv/bin/python -m pip install dist/profy_filter-*.whl
+          cd /tmp
+          /tmp/profy-release-venv/bin/python - <<'PY'
+          import os
+          import profy
+          from profy import filter_text
+
+          assert profy.__version__ == os.environ["EXPECTED_VERSION"], profy.__version__
+          assert filter_text("This is shit").clean == "This is ****"
+          assert filter_text("Das ist scheisse", languages="german").clean == "Das ist ********"
+          assert filter_text("Scunthorpe").is_clean
+          assert filter_text("shit", driver="pattern").is_offensive
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: profy-dist
@@ -29,10 +78,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'
         with:
-          prerelease: true
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           files: dist/*
           generate_release_notes: true
+      # No skip-existing: re-publishing an existing version must fail loudly
+      # instead of silently reporting success for files PyPI already has.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        if: github.ref_type == 'tag'
         with:
           packages-dir: dist/
-          skip-existing: true

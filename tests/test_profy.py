@@ -29,11 +29,14 @@ def test_false_positive_words_are_not_flagged():
         assert result.clean == word
 
 
-def test_invisible_characters_are_removed_before_matching():
+def test_invisible_characters_are_ignored_for_matching_only():
     result = filter_text("f\u2063uck this")
 
     assert result.is_offensive
-    assert result.clean == "**** this"
+    # The mask covers the whole original span, invisible separator included,
+    # and the original text is reported unchanged.
+    assert result.clean == "***** this"
+    assert result.original == "f\u2063uck this"
 
 
 def test_allow_and_block_lists():

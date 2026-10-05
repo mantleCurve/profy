@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Behavior changes
+
+- Unknown language names now raise `ValueError` listing the available languages (for example `languages="englsh"` used to silently disable detection); an empty selection also raises. Language names are case-insensitive.
+- `ShieldResult.original` is now always the exact input, and `clean` is the input with only matched spans masked. Invisible characters (zero-width spaces/joiners, bidi marks, soft hyphens, tag characters, variation selectors) are ignored for matching only, so emoji ZWJ sequences such as `👩‍💻` are no longer altered. Invisible-character obfuscation (`f\u200bu\u200bc\u200bk`) is still caught and the mask now covers the whole original span, invisible characters included; `Match.position`/`length` index the original text.
+- Ordinary double letters no longer create matches on their own: `cook`, `cookie`, `good`, `annals` and ~1,000 other dictionary words were flagged because repeated-letter expansion read them as `cok`, `god`, `anal`. Runs of three or more identical letters (`fuuuck`, `shiiiit`) are still treated as deliberate obfuscation. Forms that only double one letter of a profanity and are not dictionary entries themselves (for example `fuuckin`) are now treated like other embedded words.
+- `block` keeps the curated severity of words already in the dictionary (blocking `coon` no longer lowers it from `extreme` to `high`); new words default to `high` as before. An explicit `block` now overrides a bundled false positive for that word (`block=["class"]` masks `class`). `allow` still wins over `block`.
+- Blank or whitespace-only `allow`/`block` entries are ignored (`block=[""]` used to hang forever), entries are stripped, and a single string counts as one word. Non-string entries raise `TypeError`.
+- Combining languages (`languages=[...]` with more than one entry, or `all_languages=True`) only merges accent/diacritic substitutions, as upstream Blasp does, so `sock` is no longer masked in an English+German filter.
+
+### New
+
+- `driver="pattern"` option on `ProfanityFilter`, `filter_text`, `check_text` and `clean_text`: a port of Blasp's literal `PatternDriver` (exact, whole-word, case-insensitive matches). The default `driver="regex"` is unchanged.
+
+### Fixes
+
+- Fixed catastrophic regex backtracking: `check("*" * 22)` took ~29s and `"*" * 24` never finished. Matching is now linear in the input length: 500-character adversarial inputs built from every bundled separator and substitution character finish in well under a second in every language. Very long runs of one character are shortened for matching only (masks still cover the whole run); a letter inside a word matches at most 64 mixed variants (`uüuü...`) or 32 censoring stretches (`f*f*f*...`) in a row.
+- `filter_text`, `check_text` and `clean_text` no longer rebuild the dictionary on every call (~1.5s each); compiled dictionaries are cached per option set (bounded, thread-safe) and shared with `ProfanityFilter` instances, and filters that only differ by their allow/block lists reuse each other's compiled expressions.
+
+### Tooling
+
+- `scripts/sync_from_blasp.py` now pulls only the per-language word lists from upstream and no longer overwrites `profy/data/global.json` or per-language substitutions, which are Profy-owned. Upstream and external word lists are stored as separate layers under `sources/` and assembled deterministically, so the two sync scripts no longer clobber each other. Sync metadata is rewritten only when upstream changes, and `--check` reports pending changes without writing.
+- The release workflow verifies that the tag, `pyproject.toml` and `profy.__version__` agree, marks GitHub Releases as pre-releases only for PEP 440 pre-release versions, smoke-tests the built wheel in a clean virtualenv, and no longer skips already-published files silently. Manual runs are dry runs.
+- CI tests Python 3.9-3.14 and enforces 100% line and branch coverage.
+
 ## 0.1.2
 
 - Fixed a false positive where a legitimate word adjacent to digits was masked because of a contained profanity. For example `hello9` was cleaned to `****o9` (matching `hell`). The Scunthorpe-style substring guard previously only applied when the entire surrounding `\w`-context was purely alphabetic, so a trailing/leading digit disabled it. The guard now inspects the surrounding alphabetic run (via `_alpha_word_context`), so words like `hello9`, `9hello`, `shell9`, and `scunthorpe9` stay clean while bare profanities with appended digits (`hell9`, `ass9`) are still masked.

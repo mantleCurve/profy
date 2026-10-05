@@ -93,7 +93,7 @@ def test_letters_made_only_of_separators():
     expressions = core._generate_expressions(["xx", "xxa"], ["*", "!"], {"/x/": ["*", "!"], "/a/": ["a"]})
     assert expressions["xx"].fullmatch("*!")
     assert expressions["xxa"].fullmatch("**a")
-    assert core._split_run_expression(core._Token(frozenset("*!"), ()), "[!*]", ["*", "!"], frozenset("*!")) == ""
+    assert core._split_run_expression(core._Token(frozenset("*!"), ()), "[!*]", ["*", "!"], frozenset("*!"), []) == ""
 
 
 def test_gap_expression_edge_cases():
@@ -190,13 +190,12 @@ def test_run_index():
     assert index.around(3, 4) == (3, 5)
     assert index.around(2, 3) == (0, 5)
     assert index.around(10, 11) == (10, 11)
-    index.split(1, 4)
-    assert (index.starts, index.ends) == ([0, 4, 6, 10], [1, 5, 8, 11])
-    index.split(9, 10)
-    assert (index.starts, index.ends) == ([0, 4, 6, 10], [1, 5, 8, 11])
-    index.split(6, 8)
-    assert (index.starts, index.ends) == ([0, 4, 10], [1, 5, 11])
     assert core._RunIndex("", r"\w+").around(0, 0) == (0, 0)
+
+
+def test_mask_spans():
+    assert core._mask_spans("abcdef", [(4, 5), (0, 2)]) == "\x01\x01cd\x01f"
+    assert core._mask_spans("abc", []) == "abc"
 
 
 @pytest.mark.parametrize(
@@ -271,3 +270,11 @@ def test_shorten_runs_with_mapping():
     text, span_map = core._shorten_runs_with_mapping("xaaaaay", [(i, i + 1) for i in range(7)], r"(.)\1{3,}", 3)
     assert text == "xaaay"
     assert span_map == [(0, 1), (1, 2), (2, 3), (3, 6), (6, 7)]
+
+
+def test_phrase_break_retry_is_still_guarded():
+    # The shorter retry before the phrase break is rejected too when it still
+    # spans words ("x|ab cd" starts inside a word and its tail is plain).
+    shield = _with_extra_expressions(ProfanityFilter(block=["zz-retry"]), ("zz-ab", re.compile("ab cd, ef|ab cd")))
+    result = _within(30, shield.check, "xab cd, efx")
+    assert result.is_clean

@@ -1,5 +1,23 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening, Codex review pass 3)
+- P1 per-match mutation: masks are applied once per pass (`_mask_spans`),
+  same-pass claims use a bytearray, original-coordinate claims a bytearray,
+  run indexes are rebuilt per pass (removed `_RunIndex.split` and `_claim`).
+  One-word filter "shit "*512000: 79.6s -> 4.0s. Default filter "shit "*32000
+  stays ~7.9s: ~95% is one regex scan per entry per pass (pass 1 ~5.2s, the
+  confirming pass ~2.4s over 160k chars); Python bookkeeping ~0.7s.
+- P2 block words match themselves: split runs keep separators later literal
+  tokens need, entries collapse whitespace, blocked entries win length ties,
+  pattern driver uses (?<!\w)/(?!\w) edges and \s+ for spaces; literal
+  expressions are cached per word (`_compile_literal`). Property test over a
+  curated set plus 300 seeded random words, both drivers.
+- P2 phrase-break retry: a candidate rejected for crossing a phrase break is
+  re-matched with the text cut before the break ("hell, Lloyd").
+- P2 rare doubles in compounds: per-side edge rule (`_ends_with_profanity`,
+  `_starts_with_profanity`) plus abutment with accepted matches
+  (`touches_before`/`touches_after`).
+
 ## 2026-10-06 (fix/codex-review-hardening, Codex review pass 2)
 - P1 quadratic scanning: `_RunIndex` (bisect over `\w`, hex and letter runs,
   built once per check and split on masking), cached hex-token verdicts

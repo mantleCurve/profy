@@ -190,6 +190,46 @@ def test_separator_obfuscation_with_inflections(english, text, clean):
 @pytest.mark.parametrize(
     "text, clean",
     [
+        ("hell, Lloyd", "****, Lloyd"),
+        ("Hell, llama", "****, llama"),
+        ("hell ,Lloyd", "**** ,Lloyd"),
+        ("ass, sam", "***, sam"),
+        ("ass, Sasha", "***, Sasha"),
+        ("shit, tom", "****, tom"),
+        ("shit; tina", "****; tina"),
+        ("fuck, kim", "****, kim"),
+        ("fuck! kkk", "****! ***"),
+        ("damn, nancy", "****, nancy"),
+    ],
+)
+def test_profanity_before_a_word_starting_with_its_last_letters(english, text, clean):
+    # The match once ran across the phrase break into the next word
+    # ("hell, Ll"), was rejected, and the plain "hell" was never retried.
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
+        ("biitchfuck", "**********"),
+        ("twaatfuck", "*********"),
+        ("priickfuck", "**********"),
+        ("fuckbiitch", "**********"),
+        ("shiitfuck", "*********"),
+        ("fuuckshit", "*********"),
+        # Clean-word protections still hold.
+        ("cookfuck", "cookfuck"),
+        ("vacuumfuck", "vacuumfuck"),
+        ("xbiitchfuck", "xbiitchfuck"),
+    ],
+)
+def test_rare_doubles_inside_compounds(english, text, clean):
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
         ("shitxshithell", "shitx********"),
         ("hellxhellshit", "hellx********"),
         ("shitshit", "********"),

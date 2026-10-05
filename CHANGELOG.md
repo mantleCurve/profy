@@ -21,6 +21,10 @@
 ### Fixes
 
 - Fixed catastrophic regex backtracking: `check("*" * 22)` took ~29s and `"*" * 24` never finished. Matching is now linear in the input length: 500-character adversarial inputs built from every bundled separator and substitution character finish in well under a second in every language. Very long runs of one character are shortened for matching only (masks still cover the whole run); a letter inside a word matches at most 64 mixed variants (`uüuü...`) or 32 censoring stretches (`f*f*f*...`) in a row.
+- Match-dense text was quadratic (`"shit " * 512000` took ~80s with a one-word filter, now ~4s): accepted matches are masked once per pass instead of copying the text and shifting index lists per match.
+- A block word now always matches its own text: `full-length`, `cross-site` and `niggardliness's` did not match because a run of repeated letters swallowed the separator the word spells later; entries with internal whitespace and, with `driver="pattern"`, entries that start or end with a symbol (`c++`, `100%`) did not match either; and an equally long bundled entry could claim part of it first.
+- `hell, Lloyd` and `Hell, llama` were left unmasked: a match that runs across a phrase break into the next word is now retried before the break.
+- Rarely doubled letters inside compounds (`biitchfuck`, `twaatfuck`) are caught; a match directly touching another match counts as a compound.
 - Scanning long tokens was quadratic (`"a55" * 2000` took ~4.5s, `"shit" * 4000` ~33s): word, hex-token and letter contexts are now looked up in run indexes built once per check, overlap checks use bisect, and masking no longer copies the position map per match.
 - Inflections are handled completely: `shittier`, `crappier` and `crappiest` were no longer caught; the y -> i endings (`-ies/-ied/-ier/-iest/-ily/-iness`) now count after a doubled consonant or when the y-adjective is a dictionary word.
 - Obfuscated plurals across punctuation (`f, u, c, kheads`, `sh, itheads`) are caught again, without reintroducing `shit, s|ing` bleed.

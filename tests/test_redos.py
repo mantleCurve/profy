@@ -14,6 +14,7 @@ import time
 import pytest
 
 from helpers import ROOT
+from profy import ProfanityFilter
 
 # Generous: typical inputs take ~5-40 ms; the regression took seconds to forever.
 PER_INPUT_BUDGET = 2.0
@@ -168,3 +169,24 @@ def test_scanning_scales_linearly_with_long_tokens(english, shape):
     large = _best_of_two(english, make(2000))
     assert large < 5.0, (shape, large)
     assert large / max(small, 0.02) < 9, (shape, small, large)
+
+
+def test_match_dense_text_scales_linearly():
+    # Masking used to copy the working text and shift index lists per match,
+    # so "shit " * 128000 took ~5.7s and * 512000 ~80s with a one-word filter.
+    data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
+    single = ProfanityFilter(allow=[word for word in data["profanities"] if word.lower() != "shit"])
+    assert list(single.dictionary.expressions) == ["shit"]
+    small = _best_of_two(single, "shit " * 8000)
+    large = _best_of_two(single, "shit " * 32000)
+    assert single.check("shit " * 32000).count == 32000
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < 9, (small, large)
+
+
+def test_match_dense_text_with_the_default_filter(english):
+    small = _best_of_two(english, "shit " * 500)
+    large = _best_of_two(english, "shit " * 2000)
+    assert english.check("shit " * 2000).count == 2000
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < 9, (small, large)

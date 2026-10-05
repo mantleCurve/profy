@@ -1,3 +1,5 @@
+import random
+import string
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -239,6 +241,40 @@ def test_pattern_driver_filters_severity_before_deduplicating_overlaps():
     result = filter_text("hi coon", driver="pattern", block=["hi coon"], minimum_severity="extreme")
     assert result.clean == "hi ****"
     assert [match.base for match in result.matches] == ["coon"]
+
+
+BLOCK_WORDS = [
+    "full-length", "cross-site", "all-languages", "niggardliness's", "Ab-Ba", "a--b", "x.y", "e-mail", "o'clock",
+    "rock'n'roll", "co-op", "re-enter", "pre-existing", "well-off", "zz top", "two  words", "tic tac toe", "R2-D2",
+    "covid19", "404", "1337", "a1b2c3", "!!wow", "wow!!", "@home", "#hashtag", "c++", "c#", "f*ck", "s!h!t",
+    "$money$", "100%", "a/b", "(x)", "[tag]", "{brace}", "aaaa", "aaaaaaaaaaaa", "bookkeeper", "mississippi",
+    "llama", "ssss-ssss", "M\u00e4dchen", "na\u00efve", "fa\u00e7ade", "\u0395\u03bb\u03bb\u03ac\u03b4\u03b1",
+    "\u65e5\u672c", "\U0001F600", "a\U0001F600b", "MiXeD", "UPPER", "\u0141\u00d3D\u0179", "stra\u00dfe",
+    "x", "ab", "a b", "a-", "-a", "...", "--", "_under_", "tab\tbed", "*6zy",
+]
+
+
+def _random_block_words(count):
+    rng = random.Random(20261006)
+    alphabet = string.ascii_letters + string.digits + "-'_.!*@ \u00e4\u00f6\u00fc\u00e9"
+    words = ("".join(rng.choice(alphabet) for _ in range(rng.randint(1, 14))) for _ in range(count))
+    return [word for word in words if word.strip()]
+
+
+@pytest.mark.parametrize("driver", ["regex", "pattern"])
+def test_a_block_word_always_masks_its_own_text(driver):
+    for word in BLOCK_WORDS + _random_block_words(300):
+        result = filter_text(word, block=[word], driver=driver)
+        core = word.strip()
+        lead = word[: len(word) - len(word.lstrip())]
+        expected = lead + "*" * len(core) + word[len(lead) + len(core) :]
+        assert result.original == word
+        assert result.clean == expected, (driver, word, result.clean)
+
+
+def test_block_entries_collapse_whitespace():
+    assert filter_text("say two \t words", block=["two   words"]).clean == "say " + "*" * 11
+    assert filter_text("say two \t words", block=["two   words"], driver="pattern").clean == "say " + "*" * 11
 
 
 def test_long_block_words_match():

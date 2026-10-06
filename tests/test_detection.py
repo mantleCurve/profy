@@ -356,6 +356,56 @@ def test_chains_of_rare_double_candidates(english, text, clean):
 @pytest.mark.parametrize(
     "text, clean",
     [
+        # A candidate that could lean on either side must not be judged by the
+        # side that has no neighbour ("bitchh" at the start of the word).
+        ("bitchhbiitch", "************"),
+        ("biitchbitchh", "************"),
+        ("damnnbiitch", "***********"),
+        ("biitchdamnn", "***********"),
+        ("bitchhbiitchhfuck", "*****************"),
+        ("fuckbitchhbiitch", "****************"),
+        ("biitchbitchhbiitch", "******************"),
+        ("bitchhbiitchbitchh", "******************"),
+        ("bitchh shiit biitch", "****** ***** ******"),
+        # Still protected: the chain does not reach the word's end, or a
+        # rare double inside an ordinary word.
+        ("bitchhbiitchx", "bitchhbiitchx"),
+        ("bitchhx", "bitchhx"),
+        ("xbiitchbiitch", "xbiitchbiitch"),
+        ("vacuumvacuum", "vacuumvacuum"),
+        ("cookbiitch", "cookbiitch"),
+    ],
+)
+def test_chains_with_either_neighbour(english, text, clean):
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
+        # Consonant-only abbreviations chained across the whole word.
+        ("shtdck", "******"),
+        ("ccksck", "******"),
+        ("shtcnt", "******"),
+        # Inside a longer word they are ordinary letters of it.
+        ("sangreeroot", "sangreeroot"),
+        ("dckmngr", "dckmngr"),
+    ],
+)
+def test_chains_of_abbreviations(english, text, clean):
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize("text", ["xsuspekty", "xsuspektery", "xpoppty", "ppoppt"])
+def test_two_letter_entries_make_no_chain(text):
+    # German "zu" and "po" are entries, but like compound parts a chain needs
+    # words of three or more letters ("su|spek" inside "xsuspekty").
+    assert filter_text(text, languages="german").clean == text
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
         ("shitxshithell", "shitx********"),
         ("hellxhellshit", "hellx********"),
         ("shitshit", "********"),

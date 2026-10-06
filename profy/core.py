@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -167,6 +167,37 @@ class ProfanityFilter:
         # Letters of the unmasked text, for the Scunthorpe guard.
         letters = _RunIndex(normalized, r"[a-zA-Z]+")
 
+        # An explicit block entry is judged on the visible input (``text``: the
+        # original without invisible characters, before normalization and run
+        # shortening). Built on first use.
+        visible: list[int] = []
+        alphanumeric: list[_RunIndex] = []
+        token_roots: dict[tuple[int, int], tuple[str, int]] = {}
+
+        def is_exact_block(start: int, end: int, base: str) -> bool:
+            """Whether a match of the explicit block entry ``base`` is that
+            entry as typed (case-folded, invisible characters and whitespace
+            runs ignored) and not part of a longer alphanumeric token, or lies
+            in a token that is nothing but the entry repeated ("1212|1212").
+            Such a match skips every heuristic guard."""
+            if not visible:
+                visible.extend(span[0] for span in text_map)
+                alphanumeric.append(_RunIndex(text, r"[^\W_]+"))
+            # Spans grow left to right, so the match's ends give its extent.
+            first, last = bisect_left(visible, working_map[start][0]), bisect_left(visible, working_map[end - 1][1])
+            occurrence = text[first:last].lower()
+            if occurrence != base and " " in base:
+                occurrence = " ".join(occurrence.split())
+            if occurrence == base and not (
+                first and _ALPHANUMERIC.match(text, first - 1) and _ALPHANUMERIC.match(text, first)
+            ) and not (last < len(text) and _ALPHANUMERIC.match(text, last - 1) and _ALPHANUMERIC.match(text, last)):
+                return True
+            token = alphanumeric[0].around(first, last)
+            if token not in token_roots:
+                folded = text[token[0] : token[1]].lower()
+                token_roots[token] = (folded, _root_length(folded))
+            return _repeats(*token_roots[token], base)
+
         matches: list[Match] = []
         # Original characters already claimed by a match (several normalized
         # characters can come from one original character).
@@ -193,12 +224,9 @@ class ProfanityFilter:
             words = _RunIndex(working, r"\w+")
             hex_runs = _RunIndex(working, r"[0-9a-fA-F-]+")
             hex_verdicts: dict[tuple[int, int], bool] = {}
-            # Hex tokens a block word may fill: their case-folded text and the
-            # length of their shortest repeated unit, computed once per token.
-            token_roots: dict[tuple[int, int], tuple[str, int]] = {}
             taken = bytearray(len(working))
             accepted: list[tuple[int, int]] = []
-            pending: list[tuple[int, int, str, bool, bool]] = []
+            pending: list[tuple[int, int, str, tuple[tuple[bool, bool], ...]]] = []
 
             def masked(index: int) -> bool:
                 return 0 <= index < len(working) and (working[index] == "\x01" or bool(taken[index]))
@@ -209,15 +237,6 @@ class ProfanityFilter:
                     word_end - word_start <= dictionary.longest_false_positive
                     and working[word_start:word_end].lower() in dictionary.false_positives
                 )
-
-            def is_whole_block_token(token: tuple[int, int], matched_text: str) -> bool:
-                # One token can hold many (distinct) matches: "12" * n with
-                # block=["12"], or "ab"/"8" variants in "ab8b8..."; each costs
-                # its own length, not the token's.
-                if token not in token_roots:
-                    folded = working[token[0] : token[1]].strip("-").lower()
-                    token_roots[token] = (folded, _root_length(folded))
-                return _repeats(*token_roots[token], matched_text)
 
             def accept(start: int, end: int, base: str) -> None:
                 taken[start:end] = b"\x01" * (end - start)
@@ -252,8 +271,13 @@ class ProfanityFilter:
                     candidates = finder.candidates(expression, previous.get(number))
                 previous[number] = candidates
                 for start, end, matched_text in candidates:
+                    # An explicit block entry's own text is masked whatever the
+                    # heuristics below would say about it.
+                    exact = base in dictionary.blocked and is_exact_block(start, end, base)
 
-                    if _is_spanning_word_boundary(matched_text, working, start):
+                    if exact:
+                        pass
+                    elif _is_spanning_word_boundary(matched_text, working, start):
                         # Rejected for running into the next word ("hell, Ll|oyd",
                         # "hell - Ll|oyd"); the same profanity may still match
                         # before the gap between the words.
@@ -291,7 +315,8 @@ class ProfanityFilter:
                     # the word's letters accepts spells none ("*Ll|oyd" as "hll").
                     elided = dictionary.elided.get(base)
                     if (
-                        elided is not None
+                        not exact
+                        and elided is not None
                         and not _spells(matched_text, *elided)
                         and not dictionary.unelided(base).fullmatch(working, start, end)
                     ):
@@ -302,12 +327,14 @@ class ProfanityFilter:
                     # characters (\x01) and this pass's matches are never reused.
                     if start == end or "\x01" in matched_text or taken.find(1, start, end) != -1:
                         continue
+                    if exact:
+                        keep_scanning = True
+                        accept(start, end, base)
+                        continue
                     token = hex_runs.around(start, end)
                     if token not in hex_verdicts:
                         hex_verdicts[token] = _is_hex_token(working[token[0] : token[1]])
-                    # An explicit block word that is the whole token, alone or
-                    # repeated, is masked anyway ("deadbeef1", "12345678", "1212|1212").
-                    if hex_verdicts[token] and not (base in dictionary.blocked and is_whole_block_token(token, matched_text)):
+                    if hex_verdicts[token]:
                         continue
 
                     # For the Scunthorpe-style substring guard we use the
@@ -330,9 +357,15 @@ class ProfanityFilter:
                     if _is_pure_alpha_substring(*guard, touches_before=touches_before, touches_after=touches_after):
                         # It may still be one link of a chain of candidates that
                         # only qualify together ("biitch|biitch"); see below.
-                        need = _chain_need(guard, touches_before, touches_after)
-                        if need is not None and not is_false_positive(start, end):
-                            pending.append((start, end, base, need[0], need[1]))
+                        needs = _chain_needs(guard, touches_before, touches_after)
+                        if needs and base in dictionary.elided and not dictionary.unelided(base).fullmatch(working, start, end):
+                            # Without its vowel, a candidate inside a longer word is
+                            # just letters of it ("ngr" in "sangreeroot"): it only
+                            # counts with a word edge or a match on both sides
+                            # ("sht|dck").
+                            needs = ((bool(guard[1]) and not touches_before, bool(guard[2]) and not touches_after),)
+                        if needs and not is_false_positive(start, end):
+                            pending.append((start, end, base, needs))
                     elif not is_false_positive(start, end):
                         keep_scanning = True
                         accept(start, end, base)
@@ -473,7 +506,7 @@ class _Dictionary:
         # far around a match the substring guard needs to look.
         self.words = frozenset(word.lower() for word in profanities)
         self.longest_word = max([0] + [len(word) for word in self.words])
-        self.compound_parts = frozenset(word for word in self.words if len(word) >= 3)
+        self.compound_parts = frozenset(word for word in self.words if len(word) >= _COMPOUND_PART_MINIMUM)
         self.context_window = max([len(part) for part in self.compound_parts] + [_LONGEST_SUFFIX + 1])
         self.longest_false_positive = max([0] + [len(word) for word in self.false_positives])
         # Stop classes of the generated expressions (see _compile_profanity),
@@ -1184,45 +1217,64 @@ def _compile_literal(profanity: str) -> re.Pattern[str]:
     )
 
 
-def _chain_need(guard: tuple, touches_before: bool, touches_after: bool) -> Optional[tuple[bool, bool]]:
-    """Which side(s) of a protected candidate would have to touch another match
-    for the candidate to count as part of a compound; None if that is not
-    enough to lift the protection."""
+# Profanities this long or longer make a compound with what they abut.
+_COMPOUND_PART_MINIMUM = 3
+
+
+def _chain_needs(guard: tuple, touches_before: bool, touches_after: bool) -> tuple[tuple[bool, bool], ...]:
+    """Every way a protected candidate can count as part of a compound: the
+    side(s) (before, after) that would still have to touch another match, the
+    minimal alternatives only; empty if touching cannot lift the protection.
+
+    All alternatives are kept: "bitchh|biitch" can only lean on its right
+    neighbour, although touching on the left would lift it too.
+    """
+    needs: list[tuple[bool, bool]] = []
     for need_before, need_after in ((True, False), (False, True), (True, True)):
+        if need_before and need_after and needs:
+            break  # touching on one side suffices; both is no further way
         if not _is_pure_alpha_substring(
             *guard,
             touches_before=touches_before or need_before,
             touches_after=touches_after or need_after,
         ):
-            return need_before and not touches_before, need_after and not touches_after
-    return None
+            needs.append((need_before and not touches_before, need_after and not touches_after))
+    return tuple(needs)
 
 
 def _resolve_chains(
-    pending: list[tuple[int, int, str, bool, bool]],
+    pending: list[tuple[int, int, str, tuple[tuple[bool, bool], ...]]],
     masked: Callable[[int], bool],
 ) -> list[tuple[int, int, str]]:
-    """The greatest set of pending candidates whose needed sides each touch a
-    match or another candidate of the set, without overlaps.
+    """The greatest set of pending candidates, without overlaps, in which each
+    candidate has one alternative (see ``_chain_needs``) whose needed sides all
+    touch a match or another candidate of the set. Like a compound part, a
+    supporting candidate must be a word of three or more letters: "su" read as
+    "zu" next to "spek" read as "speck" makes no compound in "xsuspekty".
 
-    Linear-time support counting: a candidate whose needed neighbour count
-    drops to zero is removed and its neighbours lose its support in turn.
+    Linear-time support counting: a candidate none of whose alternatives is
+    supported any more is removed, and its neighbours lose its support in turn.
     """
-    alive = [not any(masked(index) for index in range(start, end)) for start, end, _, _, _ in pending]
+    alive = [not any(masked(index) for index in range(start, end)) for start, end, _, _ in pending]
 
     def settle() -> None:
         ending: dict[int, list[int]] = {}
         starting: dict[int, list[int]] = {}
-        for index, (start, end, _, _, _) in enumerate(pending):
-            if alive[index]:
+        for index, (start, end, base, _) in enumerate(pending):
+            if alive[index] and len(base) >= _COMPOUND_PART_MINIMUM:
                 ending.setdefault(end, []).append(index)
                 starting.setdefault(start, []).append(index)
-        support = []
-        for index, (start, end, _, need_before, need_after) in enumerate(pending):
-            before = len(ending.get(start, ())) if need_before and not masked(start - 1) else -1
-            after = len(starting.get(end, ())) if need_after and not masked(end) else -1
-            support.append([before, after])
-        queue = [index for index in range(len(pending)) if alive[index] and 0 in support[index]]
+        # Live neighbours on each side that can support a chain.
+        before = [len(ending.get(start, ())) for start, _, _, _ in pending]
+        after = [len(starting.get(end, ())) for _, end, _, _ in pending]
+
+        def supported(index: int) -> bool:
+            start, end, _, needs = pending[index]
+            left = before[index] > 0 or masked(start - 1)
+            right = after[index] > 0 or masked(end)
+            return any((left or not need_before) and (right or not need_after) for need_before, need_after in needs)
+
+        queue = [index for index in range(len(pending)) if alive[index] and not supported(index)]
         while queue:
             index = queue.pop()
             if not alive[index]:
@@ -1230,28 +1282,26 @@ def _resolve_chains(
             alive[index] = False
             start, end = pending[index][0], pending[index][1]
             for neighbour in ending.get(start, ()):
-                if alive[neighbour] and support[neighbour][1] > 0:
-                    support[neighbour][1] -= 1
-                    if support[neighbour][1] == 0:
-                        queue.append(neighbour)
+                after[neighbour] -= 1
+                if alive[neighbour] and not supported(neighbour):
+                    queue.append(neighbour)
             for neighbour in starting.get(end, ()):
-                if alive[neighbour] and support[neighbour][0] > 0:
-                    support[neighbour][0] -= 1
-                    if support[neighbour][0] == 0:
-                        queue.append(neighbour)
+                before[neighbour] -= 1
+                if alive[neighbour] and not supported(neighbour):
+                    queue.append(neighbour)
 
     settle()
     # Overlapping survivors (different words over the same letters): keep the
     # first (longer words come first), then settle the supports again.
     claimed: set[int] = set()
-    for index, (start, end, _, _, _) in enumerate(pending):
+    for index, (start, end, _, _) in enumerate(pending):
         if alive[index]:
             if claimed.intersection(range(start, end)):
                 alive[index] = False
             else:
                 claimed.update(range(start, end))
     settle()
-    return [(start, end, base) for index, (start, end, base, _, _) in enumerate(pending) if alive[index]]
+    return [(start, end, base) for index, (start, end, base, _) in enumerate(pending) if alive[index]]
 
 
 # The windowed rescan does a few searches per masked span and expression; past
@@ -1608,6 +1658,7 @@ _PHRASE_BREAK = re.compile(r"[,.;:?!]\s|\s[,.;:?!]")
 # whitespace (", ", " - ", " / ").
 _NON_WORD_RUN = re.compile(r"\W+")
 _LETTER = re.compile(r"[^\W\d_]")
+_ALPHANUMERIC = re.compile(r"[^\W_]")
 # A plain word (letters and digits), symbols (or "_"), then letters: "hell-Ll",
 # "sh1t-t", "hell_Ll".
 _JOINED_WORDS = re.compile(r"([^\W_]+)((?:[^\w\s]|_)+)([^\W\d_]+)")

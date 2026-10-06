@@ -1,5 +1,39 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening, Codex review pass 8)
+- P2 chain alternatives: `_chain_needs` returns every minimal alternative
+  (left, right, both) instead of the first; `_resolve_chains` keeps a
+  candidate while any alternative's sides are supported (same linear support
+  counting). "bitchhbiitch", "damnnbiitch", "bitchhbiitchhfuck" are caught.
+  Keeping all alternatives exposed chains the arbitrary choice used to drop:
+  supporting candidates must now be entries of 3+ letters
+  (`_COMPOUND_PART_MINIMUM`, as for compound parts: German "su|spek" read as
+  zu|speck in "xsuspekty"), and an elided candidate needs a word edge or a
+  match on both sides ("sht|dck" yes, "sangreeroot"'s "ngr|eeroo" no).
+- P2 one predicate for explicit block entries (`is_exact_block` in check()):
+  judged on the visible input (original minus invisible characters, before
+  normalization and run shortening): the case-folded, whitespace-collapsed
+  match text equals the entry and neither edge continues an alphanumeric
+  token, or the alphanumeric token around it is the entry repeated (per-token
+  root length cached per check). It holds before every heuristic and skips
+  them all (cross-word bleed and retry, joined-word cut, elision, hex/UUID,
+  Scunthorpe/compound/chains, false positives); replaces the hex-only
+  exemption. Fixes "-12345678", "12345678-", "-deadbeef1-"; "ab" in
+  "ab12cd34ef" and "ab8ab8ab8" (an obfuscated form) stay protected; "abab"
+  with block=["ab"] is now masked (entry repeated).
+- Property test `test_a_block_word_with_any_separators_masks_its_own_text`:
+  1050 entries (hex-like, digit-only, mixed-case, plain, spaced cores x every
+  separator, space and ZWSP/ZWJ/VS16 before, after, around, inside, doubled)
+  in one filter per driver; r8 fails 12 (regex). Random entries now draw
+  from every separator too.
+- Distinct-match hex scaling test resized to 3000 vs 12000 (r7 x10.6, now
+  x4.3; 3.9 under coverage stayed below the 5s ceiling at the old size only
+  barely).
+- Differential vs pass 7 (r8), all corpora x 4 languages: 0 lost, 7 gained
+  (6 English consonant-only compounds spanning the word: ccksck, shtdck,
+  shtcnt, sckdck, bttbng, nggrdng; 1 cross-language), no mask changes.
+  Windowed/compacted vs full scan: 0 diffs. Dictionary scan: 845, identical.
+
 ## 2026-10-06 (fix/codex-review-hardening, Codex review pass 7)
 - P2 joined-word cut vs compounds: "ass-holefuck" was cut to "ass", leaving
   "fuck" protected inside "holefuck" (unchanged at minimum_severity="high").

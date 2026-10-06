@@ -269,7 +269,7 @@ INVISIBLE_BLOCK_WORDS = [
 
 def _random_block_words(count):
     rng = random.Random(20261006)
-    alphabet = string.ascii_letters + string.digits + "-'_.!*@ \u00e4\u00f6\u00fc\u00e9\u200b\u200d\ufe0f"
+    alphabet = string.ascii_letters + string.digits + "".join(SEPARATORS) + " \t\u00e4\u00f6\u00fc\u00e9\u200b\u200d\ufe0f"
     words = ("".join(rng.choice(alphabet) for _ in range(rng.randint(1, 14))) for _ in range(count))
     return [word for word in words if word.strip()]
 
@@ -298,6 +298,30 @@ def _expected_own_mask(word, driver):
     while end < len(word) and _modifies_previous(word[end]):
         end += 1
     return word[:start] + "*" * (end - start) + word[end:]
+
+
+SEPARATORS = json.loads((ROOT / "profy" / "data" / "global.json").read_text(encoding="utf-8"))["separators"]
+
+
+def _shaped_block_words():
+    # Hex-like, digit-only, mixed-case, plain and spaced cores with every
+    # separator before, after, around and inside them, plus invisible
+    # characters in the same places.
+    cores = ["12345678", "DeadBeef1", "9" * 12, "MiXeD", "a1b2", "ab cd"]
+    for core in cores:
+        for mark in SEPARATORS + [" ", "\u200b", "\u200d", "\ufe0f"]:
+            yield from (mark + core, core + mark, mark + core + mark, core[:2] + mark + core[2:], mark * 2 + core)
+
+
+@pytest.mark.parametrize("driver", ["regex", "pattern"])
+def test_a_block_word_with_any_separators_masks_its_own_text(driver):
+    # Heuristic guards vetoed explicit entries' own text three times
+    # ("-12345678" stayed clean: the hex guard saw a long identifier). One
+    # filter holds them all; each entry is checked on its own text.
+    words = sorted({word for word in _shaped_block_words() if word.strip() and _expected_own_mask(word, driver) != word})
+    shield = ProfanityFilter(block=words, driver=driver)
+    failures = [(word, shield.check(word).clean) for word in words if shield.check(word).clean != _expected_own_mask(word, driver)]
+    assert not failures, failures[:20]
 
 
 @pytest.mark.parametrize("driver", ["regex", "pattern"])
@@ -361,6 +385,35 @@ def test_block_words_with_long_runs_do_not_affect_other_letters():
     stretched = "f" + "u" * 100 + "ck"
     assert filter_text(stretched, block=["x" * 300]).clean == "*" * len(stretched)
     assert filter_text("x" * 600, block=["x" * 300]).clean == "*" * 600
+
+
+@pytest.mark.parametrize(
+    "text, block, clean",
+    [
+        # The hex guard compared the token without its boundary hyphens with
+        # the entry including them, so these stayed clean.
+        ("-12345678", "-12345678", "*********"),
+        ("12345678-", "12345678-", "*********"),
+        ("-deadbeef1-", "-deadbeef1-", "***********"),
+        ("id -12345678 ok", "-12345678", "id ********* ok"),
+        # An entry separated from its neighbours by symbols is no part of them.
+        ("x:12121212", "1212", "x:********"),
+        ("ab-deadbeef1", "deadbeef1", "ab-*********"),
+        # A token of nothing but the entry repeated is the entry.
+        ("12121212", "1212", "********"),
+        ("abab", "ab", "****"),
+        # Embedded in a longer token, or only an obfuscated form: protected.
+        ("id ab12cd34ef", "ab", "id ab12cd34ef"),
+        ("ab8ab8ab8", "ab", "ab8ab8ab8"),
+        ("0" * 11, "00", "0" * 11),
+        ("a classroom", "class", "a classroom"),
+        # Exactness is judged on the text as typed, not its normalized form.
+        ("Stra\u00dfe", "stra\u00dfe", "******"),
+    ],
+)
+def test_explicit_block_entries_skip_every_heuristic(text, block, clean):
+    options = {"languages": "german"} if "\u00df" in block else {}
+    assert filter_text(text, block=[block], **options).clean == clean
 
 
 def test_block_words_inside_longer_hex_tokens_stay_protected():

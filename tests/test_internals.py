@@ -337,33 +337,59 @@ def test_phrase_break_retry_is_still_guarded():
     assert result.is_clean
 
 
+def _alone(need_before, need_after):
+    return ((need_before, need_after),)
+
+
 def test_resolve_chains():
     masked = lambda index: index in {20}  # noqa: E731
     pending = [
-        (0, 3, "a", False, True),  # needs the right neighbour (3, 6)
-        (3, 6, "b", True, False),  # needs the left neighbour (0, 3)
-        (10, 13, "c", True, False),  # needs a left neighbour, has none
-        (13, 16, "d", True, False),  # leans on (10, 13), which falls
-        (17, 20, "e", False, True),  # touches a masked character
-        (3, 5, "f", True, False),  # overlaps (3, 6), which came first
+        (0, 3, "aaa", _alone(False, True)),  # needs the right neighbour (3, 6)
+        (3, 6, "bbb", _alone(True, False)),  # needs the left neighbour (0, 3)
+        (10, 13, "ccc", _alone(True, False)),  # needs a left neighbour, has none
+        (13, 16, "ddd", _alone(True, False)),  # leans on (10, 13), which falls
+        (17, 20, "eee", _alone(False, True)),  # touches a masked character
+        (3, 5, "fff", _alone(True, False)),  # overlaps (3, 6), which came first
     ]
-    assert core._resolve_chains(pending, masked) == [(0, 3, "a"), (3, 6, "b"), (17, 20, "e")]
-    assert core._resolve_chains([(0, 3, "a", True, False)], lambda index: index in {0, 1}) == []
+    assert core._resolve_chains(pending, masked) == [(0, 3, "aaa"), (3, 6, "bbb"), (17, 20, "eee")]
+    assert core._resolve_chains([(0, 3, "aaa", _alone(True, False))], lambda index: index in {0, 1}) == []
 
 
 def test_resolve_chains_support_counting():
     never = lambda index: False  # noqa: E731
     pending = [
-        (0, 3, "l", False, True),  # two right neighbours; one falls, one stays
-        (3, 6, "m", True, False),
-        (3, 5, "n", True, True),  # nothing starts at 5
-        (7, 10, "a", False, False),
-        (8, 10, "b", True, False),  # nothing ends at 8
-        (10, 13, "r", True, False),  # two left neighbours; one falls, one stays
-        (20, 23, "d", True, True),  # no left neighbour, and its right one falls too
-        (23, 26, "f", False, True),
+        (0, 3, "lll", _alone(False, True)),  # two right neighbours; one falls, one stays
+        (3, 6, "mmm", _alone(True, False)),
+        (3, 5, "nnn", _alone(True, True)),  # nothing starts at 5
+        (7, 10, "aaa", _alone(False, False)),
+        (8, 10, "bbb", _alone(True, False)),  # nothing ends at 8
+        (10, 13, "rrr", _alone(True, False)),  # two left neighbours; one falls, one stays
+        (20, 23, "ddd", _alone(True, True)),  # no left neighbour, and its right one falls too
+        (23, 26, "fff", _alone(False, True)),
     ]
-    assert core._resolve_chains(pending, never) == [(0, 3, "l"), (3, 6, "m"), (7, 10, "a"), (10, 13, "r")]
+    assert core._resolve_chains(pending, never) == [(0, 3, "lll"), (3, 6, "mmm"), (7, 10, "aaa"), (10, 13, "rrr")]
+
+
+def test_resolve_chains_keeps_every_alternative():
+    never = lambda index: False  # noqa: E731
+    either = ((True, False), (False, True))
+    # Only the right neighbour exists: the left alternative must not decide.
+    assert core._resolve_chains([(0, 6, "xxx", either), (6, 12, "yyy", _alone(True, False))], never) == [
+        (0, 6, "xxx"),
+        (6, 12, "yyy"),
+    ]
+    # Either side gone, the other carries it; both gone, it falls.
+    chain = [(0, 3, "aaa", _alone(False, True)), (3, 6, "bbb", either), (6, 9, "ccc", _alone(True, False))]
+    assert core._resolve_chains(chain, never) == [(0, 3, "aaa"), (3, 6, "bbb"), (6, 9, "ccc")]
+    assert core._resolve_chains([(3, 6, "bbb", either)], never) == []
+
+
+def test_resolve_chains_needs_supporters_of_three_letters():
+    never = lambda index: False  # noqa: E731
+    either = ((True, False), (False, True))
+    # A two-letter candidate supports nothing, so its neighbour falls too.
+    assert core._resolve_chains([(0, 2, "zu", either), (2, 6, "speck", either)], never) == []
+    assert core._resolve_chains([(0, 3, "zuu", either), (3, 7, "speck", either)], never) == [(0, 3, "zuu"), (3, 7, "speck")]
 
 
 STRATEGY_TEXTS = [

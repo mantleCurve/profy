@@ -416,6 +416,33 @@ def test_explicit_block_entries_skip_every_heuristic(text, block, clean):
     assert filter_text(text, block=[block], **options).clean == clean
 
 
+# Entries whose letters a language's normalization rewrites in the text:
+# German "sch" -> "sh" (stretched too), "ß" -> "ss", umlauts -> "ae"/"oe"/"ue";
+# Spanish "ll" -> "y", "rr" -> "r"; French accents and "œ"; and the
+# multi-letter keys (sch, ss, ll, rr, qu, ch, ck), stretched and not.
+NORMALIZED_BLOCK_WORDS = {
+    "german": [
+        "Fischh\u00e4ndler", "schhh", "sch", "Schschsch", "Stra\u00dfe", "Strasse", "gro\u00df", "\u00df\u00df", "Fu\u00dfball",
+        "M\u00fcll", "\u00d6l", "\u00e4rger", "Ruckksack", "Dreck", "Stück", "Bachh", "Tschüss", "Quatsch", "Schmutz",
+    ],
+    "spanish": ["llama", "llll", "lluvia", "calle", "perro", "perrro", "rr", "carrrro", "chulo", "cchulo", "queso", "ñoño", "Pingüino"],
+    "french": ["quiche", "qquiche", "chic", "phoque", "c\u0153ur", "\u0153il", "gar\u00e7on", "\u00e9l\u00e8ve", "No\u00ebl", "cccuisse"],
+}
+
+
+@pytest.mark.parametrize("driver", ["regex", "pattern"])
+@pytest.mark.parametrize("language", list(NORMALIZED_BLOCK_WORDS))
+def test_a_block_word_masks_its_own_text_through_normalization(language, driver):
+    # German "Fischh\u00e4ndler" stayed clean: normalization read "schh" as "sh"
+    # before the entry could match its own text.
+    failures = []
+    for word in NORMALIZED_BLOCK_WORDS[language]:
+        result = filter_text(f"a {word} b", block=[word], languages=language, driver=driver)
+        if result.clean != f"a {'*' * len(word)} b":
+            failures.append((word, result.clean))
+    assert not failures, failures
+
+
 def test_block_words_inside_longer_hex_tokens_stay_protected():
     # Only a block word that is the whole token is exempt from the hex guard.
     assert filter_text("id ab12cd34ef", block=["ab"]).clean == "id ab12cd34ef"

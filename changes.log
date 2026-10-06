@@ -1,5 +1,36 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 10)
+- P1 takeover leak: the give-back takeover (`base, expression = entry`)
+  rebound the expression loop's variables, so later matches of the scanned
+  expression were judged as the taking-over entry ("slutslut sluts" clean at
+  minimum_severity="high"; "slutslut slutsmith" masked "slutsmith"). Queued
+  candidates now carry their own entry and expression; the loop variables are
+  `scanned_base`/`scanned` and never rebound. Reviewed check() for other
+  outer state rebound in nested branches: none (start/end/matched_text,
+  retry, info and token are per candidate).
+- P2 exact block entries vs normalization: explicit block entries are matched
+  as literals (case-insensitive, any whitespace) on the visible input before
+  normalization and run shortening, judged by the exact-entry predicate on
+  that text (`is_exact_visible`), and accepted with their original spans at
+  the start of the first pass, ahead of every heuristic. Hits whose letters a
+  shortened run folded into an earlier hit's ("0" * 12 for "00") are reported
+  with their own spans and take nothing in the working text. The in-loop
+  predicate became unreachable and was removed. Fixes German "Fischhändler",
+  "schhh" and Spanish "carrrro".
+- Simplifications (Codex): full-scan dispatch only in
+  `_CandidateFinder.candidates()` (full mode returns before any lookup);
+  accepted matches kept in per-pass records (`_Accepted` with a `standing`
+  flag) and survivors appended at the end of each pass, replacing the global
+  `withdrawn` set. Proof: r10 plus only these two changes vs r10: 0 differing
+  results (masks and match metadata/order) on all 40 corpus runs, identical
+  sweep failures (29070 texts) and dictionary scan.
+- Final vs r10: corpora 0 diffs (none contain block entries); sweep 6 changed
+  outputs, all the takeover leak ("titti-titti": later copies were masked
+  although each copy alone is clean); dictionary scan identical (845);
+  windowed/compacted vs full scan 0 diffs. Tiny checks +65us (the extra
+  method call per expression), text throughput unchanged.
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 9)
 - Invariant sweep ($S/sweep.py): every bundled entry not a false positive,
   plain / one interior letter tripled / a rarely doubled letter doubled / one

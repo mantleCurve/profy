@@ -171,21 +171,18 @@ class ProfanityFilter:
         # An explicit block entry is judged on the visible input (``text``: the
         # original without invisible characters, before normalization and run
         # shortening). Built on first use.
-        visible: list[int] = []
         alphanumeric: list[_RunIndex] = []
         token_roots: dict[tuple[int, int], tuple[str, int]] = {}
 
-        def is_exact_block(start: int, end: int, base: str) -> bool:
-            """Whether a match of the explicit block entry ``base`` is that
-            entry as typed (case-folded, invisible characters and whitespace
-            runs ignored) and not part of a longer alphanumeric token, or lies
-            in a token that is nothing but the entry repeated ("1212|1212").
-            Such a match skips every heuristic guard."""
-            if not visible:
-                visible.extend(span[0] for span in text_map)
+        def is_exact_visible(first: int, last: int, base: str) -> bool:
+            """Whether ``text[first:last]`` is the explicit block entry ``base``
+            as typed (case-folded, invisible characters and whitespace runs
+            ignored) and not part of a longer alphanumeric token, or lies in a
+            token that is nothing but the entry repeated ("1212|1212"). Such a
+            match skips every heuristic guard."""
+            if not alphanumeric:
                 alphanumeric.append(_RunIndex(text, r"[^\W_]+"))
-            # Spans grow left to right, so the match's ends give its extent.
-            first, last = bisect_left(visible, working_map[start][0]), bisect_left(visible, working_map[end - 1][1])
+            base = base.lower()
             occurrence = text[first:last].lower()
             if occurrence != base and " " in base:
                 occurrence = " ".join(occurrence.split())
@@ -200,14 +197,27 @@ class ProfanityFilter:
             return _repeats(*token_roots[token], base)
 
         matches: list[Match] = []
-        # Matches withdrawn for a longer one that contains them (see replace).
-        withdrawn: set[int] = set()
         # Original characters already claimed by a match (several normalized
         # characters can come from one original character).
         claimed = bytearray(len(original))
         working = normalized
         working_map = normalized_map
         keep_scanning = True
+
+        # Explicit block entries are first found in the visible input, before
+        # language normalization and run shortening can change their letters
+        # (German reads "Fischh|ändler" as "Fishh..." and stretched "schhh" as
+        # "sh"): as (original span, working span, entry), longest entry first.
+        block_hits: list[tuple[tuple[int, int], tuple[int, int], str]] = []
+        map_bounds: list[list[int]] = []
+        for base, literal in dictionary.block_literals:
+            for found in literal.finditer(text):
+                if is_exact_visible(found.start(), found.end(), base):
+                    if not map_bounds:
+                        map_bounds.extend(([item[0] for item in normalized_map], [item[1] for item in normalized_map]))
+                    span = (text_map[found.start()][0], text_map[found.end() - 1][1])
+                    first, last = bisect_right(map_bounds[1], span[0]), bisect_left(map_bounds[0], span[1])
+                    block_hits.append((span, (first, max(first, last)), base))
 
         # Each expression's matches in the previous pass, and the spans that pass
         # masked: a confirming pass only rescans where those masks can matter.
@@ -231,9 +241,10 @@ class ProfanityFilter:
             accepted: list[tuple[int, int]] = []
             pending: list[tuple[int, int, str, tuple[tuple[bool, bool], ...]]] = []
             # Per accepted match: severity, whether it is an explicit block
-            # entry's own text, and its reported Match; and per position of
-            # ``working``, which accepted match (1-based) holds it.
-            records: list[tuple[Severity, bool, Optional[Match]]] = []
+            # entry's own text, its reported Match and whether it still stands;
+            # and per position of ``working``, which accepted match (1-based)
+            # holds it.
+            records: list[_Accepted] = []
             owners = array("i")
             # Per position, the longest pending candidate covering it (capped at
             # 255), and the shorter candidates waiting for those to be resolved.
@@ -250,7 +261,11 @@ class ProfanityFilter:
                     and working[word_start:word_end].lower() in dictionary.false_positives
                 )
 
-            def accept(start: int, end: int, base: str, exact: bool = False) -> None:
+            def accept(
+                start: int, end: int, base: str, exact: bool = False, span: Optional[tuple[int, int]] = None
+            ) -> None:
+                # An empty span takes nothing in ``working`` (see the block
+                # entries found before normalization).
                 taken[start:end] = b"\x01" * (end - start)
                 if not owners:
                     owners.frombytes(bytes(owners.itemsize * len(working)))
@@ -258,10 +273,10 @@ class ProfanityFilter:
                 accepted.append((start, end))
 
                 severity = dictionary.severity_for(base)
-                records.append((severity, exact, None))
+                records.append(_Accepted(severity, exact, None, True))
                 if self.minimum_severity is not None and not severity.is_at_least(self.minimum_severity):
                     return
-                original_start, original_end = _original_span(working_map, start, end)
+                original_start, original_end = span or _original_span(working_map, start, end)
                 # Variation selectors and tag characters belong to the character
                 # before them ("\u2764\ufe0f"), so they are masked along with it.
                 while original_end < len(original) and _modifies_previous(original[original_end]):
@@ -277,8 +292,7 @@ class ProfanityFilter:
                     length=original_end - original_start,
                     language=",".join(self.languages),
                 )
-                matches.append(match)
-                records[-1] = (severity, exact, match)
+                records[-1] = records[-1]._replace(match=match)
 
             def contained(start: int, end: int) -> Optional[list[int]]:
                 """This pass's accepted matches overlapping [start, end) when all
@@ -289,27 +303,26 @@ class ProfanityFilter:
                 while position != -1:
                     index = owners[position] - 1
                     first, last = accepted[index]
-                    if first < start or last > end or (first, last) == (start, end) or records[index][1]:
+                    if first < start or last > end or (first, last) == (start, end) or records[index].exact:
                         return None
                     inside.append(index)
                     position = taken.find(1, last, end)
                 return inside
 
-            def replace(inside: list[int], base: str, exact: bool = False) -> bool:
+            def replace(inside: list[int], base: str) -> bool:
                 """Withdraw the matches ``inside`` for one that contains them
-                ("w|hooore" for "whooore"), unless one of them is more severe
-                (an explicit block entry's own text replaces them anyway)."""
+                ("w|hooore" for "whooore"), unless one of them is more severe."""
                 severity = dictionary.severity_for(base)
-                if not exact and any(records[index][0].weight > severity.weight for index in inside):
+                if any(records[index].severity.weight > severity.weight for index in inside):
                     return False
                 for index in inside:
                     first, last = accepted[index]
                     taken[first:last] = bytes(last - first)
                     accepted[index] = (first, first)
-                    match = records[index][2]
+                    match = records[index].match
                     if match is not None:
                         claimed[match.position : match.position + match.length] = bytes(match.length)
-                        withdrawn.add(id(match))
+                    records[index] = records[index]._replace(standing=False)
                 return True
 
             def follow_from(new_end: int, old_end: int) -> None:
@@ -320,26 +333,39 @@ class ProfanityFilter:
                 for position in range(new_end, min(old_end, new_end + dictionary.longest_word)):
                     follow = expression.match(working, position)
                     if follow is not None and follow.end() > position:
-                        stack.append((position, follow.end(), follow.group(0)))
+                        stack.append((position, follow.end(), follow.group(0), base, expression))
                         return
 
-            for number, (base, expression) in enumerate(expressions):
-                if finder.mode == "full":
-                    candidates = [(found.start(), found.end(), found.group(0)) for found in expression.finditer(working)]
-                else:
-                    candidates = finder.candidates(expression, previous.get(number))
+            # The explicit block entries found before normalization, in the
+            # first pass (later passes see their masks).
+            for span, (start, end), base in block_hits:
+                if claimed.find(1, *span) == -1:
+                    if taken.find(1, start, end) != -1:
+                        # It shares the letters of a shortened run with a hit
+                        # before it ("0" * 12 for "00"): that hit took them in
+                        # ``working``; this one is only reported.
+                        end = start
+                    keep_scanning = True
+                    accept(start, end, base, exact=True, span=span)
+            block_hits = []
+
+            for number, (scanned_base, scanned) in enumerate(expressions):
+                candidates = finder.candidates(scanned, previous.get(number))
                 previous[number] = candidates
-                for candidate in candidates:
+                for found_start, found_end, found_text in candidates:
                     # A candidate may give back its end to the next occurrence
                     # (see _end_before_profanity), which is then judged next.
-                    stack = [candidate]
+                    # Each queued candidate carries the entry it is judged as:
+                    # one taking over a given-back match ("sluts" -> "slut")
+                    # never changes how the scanned expression's other matches
+                    # are judged.
+                    stack = [(found_start, found_end, found_text, scanned_base, scanned)]
                     while stack:
-                        start, end, matched_text = stack.pop()
-                        # An explicit block entry's own text is masked whatever the
-                        # heuristics below would say about it.
-                        exact = base in dictionary.blocked and is_exact_block(start, end, base)
+                        start, end, matched_text, base, expression = stack.pop()
+                        # (An explicit block entry's own text was accepted before
+                        # this loop, so every candidate here faces the heuristics.)
                         candidate_text = matched_text
-                        if not exact and _HEX_RUN.fullmatch(matched_text):
+                        if _HEX_RUN.fullmatch(matched_text):
                             # Inside one hex-like token every shorter reading lies in
                             # it too: the hex/UUID guard decides before anything else.
                             token = hex_runs.around(start, end)
@@ -348,9 +374,7 @@ class ProfanityFilter:
                             if hex_verdicts[token]:
                                 continue
 
-                        if exact:
-                            pass
-                        elif _is_spanning_word_boundary(
+                        if _is_spanning_word_boundary(
                             matched_text, working, start, dictionary.compound_parts, window, expression, dictionary.longest_match
                         ):
                             # Rejected for running into the next word ("hell, Ll|oyd",
@@ -399,7 +423,7 @@ class ProfanityFilter:
                                     # "sluts"): that entry gets it.
                                     continue
 
-                        if not exact and end < len(working) and not working[end].isspace():
+                        if end < len(working) and not working[end].isspace():
                             # A stretched run at the end may hold the first letter of a
                             # profanity that follows ("twatt|wat"): ending before it
                             # leaves that occurrence whole.
@@ -422,10 +446,11 @@ class ProfanityFilter:
                                 end = start + shorter.end()
                                 matched_text = shorter.group(0)
                                 if entry is not None:
-                                    # The rest of this candidate is judged as that entry.
+                                    # The rest of this candidate (and the copy after
+                                    # it) is judged as that entry.
                                     base, expression = entry
                                 if follow is not None and follow.end():
-                                    stack.append((end, end + follow.end(), follow.group(0)))
+                                    stack.append((end, end + follow.end(), follow.group(0), base, expression))
                             elif (
                                 working[end].lower() not in info.wildcards
                                 and info.first.match(working, end)
@@ -437,15 +462,14 @@ class ProfanityFilter:
                                 # stands for "s" too): finditer() would skip it.
                                 follow = expression.match(working[end : end + min(dictionary.longest_match, 4 * (end - start) + 16)])
                                 if follow is not None and follow.end() and not _SPACE.search(follow.group(0)):
-                                    stack.append((end, end + follow.end(), follow.group(0)))
+                                    stack.append((end, end + follow.end(), follow.group(0), base, expression))
 
                         # A match that only exists by leaving the vowel out must spell
                         # every consonant ("fck", "f--ck", "$ht"); a character any of
                         # the word's letters accepts spells none ("*Ll|oyd" as "hll").
                         elided = dictionary.info(base, expression).elision
                         if (
-                            not exact
-                            and elided is not None
+                            elided is not None
                             and not _spells(matched_text, *elided)
                             and not dictionary.unelided(base, expression).fullmatch(matched_text)
                         ):
@@ -461,14 +485,9 @@ class ProfanityFilter:
                         inside = contained(start, end) if taken.find(1, start, end) != -1 else []
                         if inside is None:
                             continue
-                        if inside and not exact and start and _ALPHANUMERIC.match(working, start - 1):
+                        if inside and start and _ALPHANUMERIC.match(working, start - 1):
                             # Starting inside a word it would also cut off the match
                             # its first letters belong to ("a|sscck" for "ass|cck").
-                            continue
-                        if exact:
-                            replace(inside, base, exact=True)
-                            keep_scanning = True
-                            accept(start, end, base, exact=True)
                             continue
                         if matched_text != candidate_text:
                             # Shortened above, it may now lie in a hex-like token.
@@ -534,11 +553,12 @@ class ProfanityFilter:
                     keep_scanning = True
                     accept(start, end, base)
 
+            # The pass's matches that were not withdrawn, in the order accepted.
+            matches.extend(record.match for record in records if record.standing and record.match is not None)
             accepted = [span for span in accepted if span[0] < span[1]]
             working = _mask_spans(working, accepted)
             changed = sorted(accepted)
 
-        matches = [match for match in matches if id(match) not in withdrawn]
         return ShieldResult(original, self._apply_masks(original, matches), tuple(matches), _score(matches, text))
 
     def clean(self, text: Optional[str]) -> str:
@@ -727,6 +747,13 @@ class _Dictionary:
             self._entries_by_lower: dict[str, list[str]] = {}
             for word in profanities:
                 self._entries_by_lower.setdefault(word.lower(), []).append(word)
+            # Each explicit block entry still in the dictionary (allow wins), as
+            # typed, longest first; see check().
+            self.block_literals = tuple(
+                (entry, re.compile(r"\s+".join(re.escape(part) for part in word.split(" ")), re.IGNORECASE | re.UNICODE))
+                for word in sorted(frozenset(blocked), key=lambda item: (-len(item), item))
+                for entry in self._entries_by_lower.get(word.lower(), ())[:1]
+            )
             # Separators no letter stands for ("-", ",", "_" but not "*", "!"),
             # and the reversed tail of a joined match (see _joined_word_cut).
             substitutes = {
@@ -951,6 +978,15 @@ def _longest_needed_run(profanities: Iterable[str], substitutions: Mapping[str, 
 _LONG_RUN = re.compile(r"(.)\1{3,}", re.DOTALL)
 _REPEATED = re.compile(r"(.)\1+", re.DOTALL)
 _WORD_CHARACTER = re.compile(r"\w")
+
+
+class _Accepted(NamedTuple):
+    """One accepted match of a pass (see ProfanityFilter.check)."""
+
+    severity: Severity
+    exact: bool
+    match: Optional[Match]
+    standing: bool
 
 
 class _ExpressionInfo(NamedTuple):
@@ -1654,17 +1690,17 @@ class _CandidateFinder:
         expression: re.Pattern[str],
         previous: Optional[list[tuple[int, int, str]]],
     ) -> list[tuple[int, int, str]]:
-        if previous is None:
-            return self._full(expression)
-        stop = self.stops.get(id(expression))
-        if stop is None:
-            return self._full(expression)
-        if self.mode == "windowed":
-            return self._windowed(expression, stop, previous)
-        return self._compacted(expression)
+        if self.mode != "full" and previous is not None:
+            stop = self.stops.get(id(expression))
+            if stop is not None:
+                if self.mode == "windowed":
+                    return self._windowed(expression, stop, previous)
+                return self._compacted(expression)
+        # A full scan (inline: this runs once per expression and pass).
+        return [(found.start(), found.end(), found.group(0)) for found in expression.finditer(self.text)]
 
     def _full(self, expression: re.Pattern[str]) -> list[tuple[int, int, str]]:
-        return [(found.start(), found.end(), found.group(0)) for found in expression.finditer(self.text)]
+        return self.candidates(expression, None)
 
     def _compacted(self, expression: re.Pattern[str]) -> list[tuple[int, int, str]]:
         if self.compact is None:

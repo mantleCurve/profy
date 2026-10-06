@@ -397,6 +397,22 @@ def test_repeated_ordinary_words_stay_clean(english, text):
     assert english.check(text).clean == text
 
 
+def test_an_entry_taking_over_a_match_does_not_change_later_ones():
+    # "sluts" gave back its "s" to "slut|slut"; the takeover leaked into how
+    # the scan judged every later "sluts" match.
+    high = ProfanityFilter(minimum_severity="high")
+    assert high.check("sluts").clean == "*****"
+    result = high.check("slutslut sluts")
+    assert result.clean == "slutslut *****"
+    assert [(match.base, match.severity) for match in result.matches] == [("sluts", Severity.HIGH)]
+    result = filter_text("slutslut sluts")
+    assert result.clean == "******** *****"
+    assert [(match.base, match.position) for match in result.matches] == [("slut", 0), ("slut", 4), ("sluts", 9)]
+    # An unrelated word after it is judged on its own.
+    assert filter_text("slutslut slutsmith").clean == "******** slutsmith"
+    assert filter_text("slutsmith").clean == "slutsmith"
+
+
 def test_a_containing_match_keeps_the_more_severe_report():
     # "whooore" reads as "w|hooore" (high) and as "whooore" (moderate): the
     # more severe reading stays, so minimum_severity="high" still masks it.

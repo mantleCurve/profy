@@ -1,3 +1,4 @@
+import copy
 import json
 import random
 import string
@@ -362,6 +363,20 @@ def test_runs_of_a_repeated_unit_block_word_are_masked_completely(english, unit)
                 assert bundled.check(text).clean == "*" * len(text), (word, count)
 
 
+def test_block_occurrences_a_shortened_run_folds_together_are_one_match():
+    # "$" * 14 keeps fewer characters for matching, so the occurrences from
+    # offset 6 on ("$$$", "$$$", "$$") share letters: one match stands for
+    # them, as the most severe entry.
+    shield = ProfanityFilter(block=["$$$", "$$"], minimum_severity="extreme")
+    dictionary = copy.copy(shield.dictionary)
+    dictionary.severity_map = {**shield.dictionary.severity_map, "$$": Severity.EXTREME, "$$$": Severity.MILD}
+    shield.dictionary = dictionary
+    result = shield.check("$" * 14)
+    assert result.clean == "$" * 6 + "*" * 8
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("$$", 6, 8)]
+    assert filter_text("$" * 14, block=["$$$", "$$"]).clean == "*" * 14
+
+
 def test_runs_of_a_repeated_block_word_keep_their_incomplete_rest():
     # Complete occurrences are masked; a leftover shorter than the word is not.
     assert filter_text("-" * 9, block=["--"]).clean == "*" * 8 + "-"
@@ -414,6 +429,44 @@ def test_block_words_with_long_runs_do_not_affect_other_letters():
 def test_explicit_block_entries_skip_every_heuristic(text, block, clean):
     options = {"languages": "german"} if "\u00df" in block else {}
     assert filter_text(text, block=[block], **options).clean == clean
+
+
+@pytest.mark.parametrize(
+    "text, block, cleans, bases",
+    [
+        # A block entry's occurrence may be covered by a longer match holding
+        # it; it used to reserve its letters first, so "n!gger" lost its
+        # extreme match and "ass hole" was cut to "*** hole".
+        ("n!gger", ["!"], ["******"] * 5, ["nigger"]),
+        ("ass hole", ["ass"], ["********"] * 3 + ["ass hole"] * 2, ["asshole"]),
+        ("shit ass", ["t a"], ["********"] * 4 + ["shit ass"], ["shit ass"]),
+        # Unless the longer match would not be reported and the entry would.
+        ("a!ss", ["!"], ["****"] * 3 + ["a*ss", "a!ss"], ["ass"]),
+        # Next to it, both are reported.
+        ("fuck!", ["!"], ["*****"] * 4 + ["fuck!"], ["fuck", "!"]),
+    ],
+)
+def test_a_longer_match_may_cover_an_explicit_block_entry(text, block, cleans, bases):
+    assert [filter_text(text, block=block, minimum_severity=level).clean for level in SEVERITY_LEVELS] == cleans
+    assert [match.base for match in filter_text(text, block=block).matches] == bases
+
+
+SEVERITY_LEVELS = [None, "mild", "moderate", "high", "extreme"]
+
+
+def test_long_block_words_do_not_stop_stretched_words_with_their_letter():
+    # A block word "u" * 100 kept every "u" run at 100 characters, longer than
+    # a letter of a bundled word may stretch, so "f" + "u" * 100 + "ck" was clean.
+    # (Three or more letters in a row are always deliberate stretching.)
+    rng = random.Random(20261007)
+    stretched = {"u": "f{}ck", "i": "sh{}t", "a": "b{}stard", "o": "b{}bs", "c": "fu{}k", "h": "s{}it"}
+    for _ in range(40):
+        letter = rng.choice(sorted(stretched))
+        size = rng.randint(1, 300)
+        shield = ProfanityFilter(block=[letter * size])
+        for length in sorted(item for item in {3, 5, 63, 64, 65, size - 1, size, size + 1, 300} if item >= 3):
+            word = stretched[letter].format(letter * length)
+            assert shield.check(word).clean == "*" * len(word), (letter, size, length)
 
 
 # Entries whose letters a language's normalization rewrites in the text:

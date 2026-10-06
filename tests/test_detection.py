@@ -413,13 +413,64 @@ def test_an_entry_taking_over_a_match_does_not_change_later_ones():
     assert filter_text("slutsmith").clean == "slutsmith"
 
 
-def test_a_containing_match_keeps_the_more_severe_report():
-    # "whooore" reads as "w|hooore" (high) and as "whooore" (moderate): the
-    # more severe reading stays, so minimum_severity="high" still masks it.
-    assert filter_text("whooore").clean == "w******"
+def test_overlapping_readings_prefer_reported_then_covered_characters():
+    # "whooore" reads as "w|hooore" (high) and as "whooore" (moderate). Both
+    # are reported by default, so the reading covering the whole word wins;
+    # with minimum_severity="high" only "hooore" would be reported, and the
+    # selection never drops it for a reading that would not be.
+    result = filter_text("whooore")
+    assert result.clean == "*******"
+    assert [(match.base, match.severity) for match in result.matches] == [("whore", Severity.MODERATE)]
     assert filter_text("whooore", minimum_severity="high").clean == "w******"
-    # A withdrawn match below minimum_severity was never reported.
+    assert filter_text("whooore", minimum_severity="extreme").clean == "whooore"
+    # A reading below minimum_severity is never reported.
     assert filter_text("fuccckd", minimum_severity="extreme").clean == "fuccckd"
+
+
+@pytest.mark.parametrize(
+    "text, options, clean",
+    [
+        # A different entry spelled across the junction of two copies, or a
+        # reading that took the next copy's first letters, used to take those
+        # letters first: the selection covers every copy instead.
+        ("@ne @ne", {"languages": "french"}, "*** ***"),  # not "@|ne @ne" as "nene"
+        ("k@kk@kk@k", {}, "*********"),
+        ("d1ccckd1ccckd1ccck", {}, "*" * 18),
+        ("succckssuccckssucccks", {}, "*" * 21),
+        ("shhit-brain-shhit-brain", {}, "***********-***********"),
+        ("eingeäscherteeingeäscherte", {"languages": "german"}, "*" * 26),
+        ("raging bonerraging boner", {}, "*" * 24),
+        ("soltar pedossoltar pedos", {"languages": "spanish"}, "*" * 24),
+        ("assshiting", {}, "**********"),  # "ass|shiting", not "ass|sshit" + "ing"
+        # Readings across a separator between copies cover nothing more.
+        ("kums,kums,kums", {}, "****,****,****"),
+        ("scheiß,scheiß", {"languages": "german"}, "******,******"),
+    ],
+)
+def test_the_selection_covers_every_copy(text, options, clean):
+    assert filter_text(text, **options).clean == clean
+
+
+@pytest.mark.parametrize(
+    "text, options, clean",
+    [
+        # The end of a word read into the next is no match, even next to
+        # another profanity that would make it a compound: a letter of it
+        # ("cabron|a $Naa" as "asna", "manipulation|s* N" as "con", "shit|s
+        # hit") or what runs up to a lone separator ("bourrin|es @" as "ecu").
+        ("cabrona $Naa", {"languages": "spanish"}, "******* $Naa"),
+        ("manipulations* Nson", {"languages": "french"}, "************** Nson"),
+        ("nichons* Nson", {"languages": "french"}, "******** Nson"),
+        ("bourrines @ Esoyd", {"languages": "french"}, "********* @ Esoyd"),
+        ("shits hit", {}, "***** hit"),
+        # A spelled-out word glued to a profanity still is a compound.
+        ("asscoc, ks", {}, "**********"),
+        ("titfucke, rs", {}, "************"),
+        ("beef curtainsbeef curtains", {}, "*" * 26),
+    ],
+)
+def test_word_ends_are_not_read_into_the_next_word(text, options, clean):
+    assert filter_text(text, **options).clean == clean
 
 
 # --- every bundled entry, repeated ---------------------------------------------------
@@ -448,23 +499,14 @@ def _stretched_variants(word, substitutions):
 
 
 # Known failures of the sample below (each copy is checked to be fully masked):
-# a different entry spelled across the junction of two copies, or inside a
-# copy that holds an earlier, more severe reading. The test fails on any other.
+# a stretched phrase glued to its own copy, which the cross-word guard does not
+# recognise as one ("big breeeastsbig breeeasts"), and copies whose letters
+# other entries read better ("\\umb ass-\\umb ass", "j!zzdj!zzdj!zzd"). All three
+# failed before the selection was redesigned too. The test fails on any other.
 KNOWN_REPEAT_FAILURES = {
     ("english", "big breasts", "triple"),
-    ("english", "cum licker", "triple"),
-    ("english", "d1ck", "leet"),
     ("english", "dumb ass", "leet"),
-    ("english", "fugly", "leet"),
     ("english", "jizzd", "leet"),
-    ("french", "chapons", "rare"),
-    ("french", "clans", "rare"),
-    ("french", "computers", "rare"),
-    ("french", "cornichons", "rare"),
-    ("french", "courriels", "rare"),
-    ("german", "eingeaescherte", "plain"),
-    ("german", "eingeaescherte", "rare"),
-    ("german", "eingeaescherte", "triple"),
 }
 
 

@@ -337,59 +337,101 @@ def test_phrase_break_retry_is_still_guarded():
     assert result.is_clean
 
 
+def _candidate(start, end, base, needs=((False, False),), order=0, reported=True):
+    return core._Candidate(start, end, base, order, needs, reported, end - start, end - start)
+
+
+def _spans(selected):
+    return [(candidate.start, candidate.end, candidate.base) for candidate in selected]
+
+
 def _alone(need_before, need_after):
     return ((need_before, need_after),)
 
 
-def test_resolve_chains():
+def test_select_chains():
     masked = lambda index: index in {20}  # noqa: E731
-    pending = [
-        (0, 3, "aaa", _alone(False, True)),  # needs the right neighbour (3, 6)
-        (3, 6, "bbb", _alone(True, False)),  # needs the left neighbour (0, 3)
-        (10, 13, "ccc", _alone(True, False)),  # needs a left neighbour, has none
-        (13, 16, "ddd", _alone(True, False)),  # leans on (10, 13), which falls
-        (17, 20, "eee", _alone(False, True)),  # touches a masked character
-        (3, 5, "fff", _alone(True, False)),  # overlaps (3, 6), which came first
+    candidates = [
+        _candidate(0, 3, "aaa", _alone(False, True)),  # needs the right neighbour (3, 6)
+        _candidate(3, 6, "bbb", _alone(True, False)),  # needs the left neighbour (0, 3)
+        _candidate(10, 13, "ccc", _alone(True, False)),  # needs a left neighbour, has none
+        _candidate(13, 16, "ddd", _alone(True, False)),  # leans on (10, 13), which falls
+        _candidate(17, 20, "eee", _alone(False, True)),  # touches a masked character
+        _candidate(3, 5, "fff", _alone(True, False)),  # overlaps (3, 6), which covers more
     ]
-    assert core._resolve_chains(pending, masked) == [(0, 3, "aaa"), (3, 6, "bbb"), (17, 20, "eee")]
-    assert core._resolve_chains([(0, 3, "aaa", _alone(True, False))], lambda index: index in {0, 1}) == []
+    assert _spans(core._select(candidates, masked)) == [(0, 3, "aaa"), (3, 6, "bbb"), (17, 20, "eee")]
+    assert core._select([], masked) == []
 
 
-def test_resolve_chains_support_counting():
+def test_select_support_counting():
     never = lambda index: False  # noqa: E731
-    pending = [
-        (0, 3, "lll", _alone(False, True)),  # two right neighbours; one falls, one stays
-        (3, 6, "mmm", _alone(True, False)),
-        (3, 5, "nnn", _alone(True, True)),  # nothing starts at 5
-        (7, 10, "aaa", _alone(False, False)),
-        (8, 10, "bbb", _alone(True, False)),  # nothing ends at 8
-        (10, 13, "rrr", _alone(True, False)),  # two left neighbours; one falls, one stays
-        (20, 23, "ddd", _alone(True, True)),  # no left neighbour, and its right one falls too
-        (23, 26, "fff", _alone(False, True)),
+    candidates = [
+        _candidate(0, 3, "lll", _alone(False, True)),  # two right neighbours; one falls, one stays
+        _candidate(3, 6, "mmm", _alone(True, False)),
+        _candidate(3, 5, "nnn", _alone(True, True)),  # nothing starts at 5
+        _candidate(7, 10, "aaa"),
+        _candidate(8, 10, "bbb", _alone(True, False)),  # nothing ends at 8
+        _candidate(10, 13, "rrr", _alone(True, False)),  # two left neighbours; one falls, one stays
+        _candidate(20, 23, "ddd", _alone(True, True)),  # no left neighbour, and its right one falls too
+        _candidate(23, 26, "fff", _alone(False, True)),
     ]
-    assert core._resolve_chains(pending, never) == [(0, 3, "lll"), (3, 6, "mmm"), (7, 10, "aaa"), (10, 13, "rrr")]
+    assert _spans(core._select(candidates, never)) == [(0, 3, "lll"), (3, 6, "mmm"), (7, 10, "aaa"), (10, 13, "rrr")]
 
 
-def test_resolve_chains_keeps_every_alternative():
+def test_select_keeps_every_alternative():
     never = lambda index: False  # noqa: E731
     either = ((True, False), (False, True))
     # Only the right neighbour exists: the left alternative must not decide.
-    assert core._resolve_chains([(0, 6, "xxx", either), (6, 12, "yyy", _alone(True, False))], never) == [
+    assert _spans(core._select([_candidate(0, 6, "xxx", either), _candidate(6, 12, "yyy", _alone(True, False))], never)) == [
         (0, 6, "xxx"),
         (6, 12, "yyy"),
     ]
     # Either side gone, the other carries it; both gone, it falls.
-    chain = [(0, 3, "aaa", _alone(False, True)), (3, 6, "bbb", either), (6, 9, "ccc", _alone(True, False))]
-    assert core._resolve_chains(chain, never) == [(0, 3, "aaa"), (3, 6, "bbb"), (6, 9, "ccc")]
-    assert core._resolve_chains([(3, 6, "bbb", either)], never) == []
+    chain = [_candidate(0, 3, "aaa", _alone(False, True)), _candidate(3, 6, "bbb", either), _candidate(6, 9, "ccc", _alone(True, False))]
+    assert _spans(core._select(chain, never)) == [(0, 3, "aaa"), (3, 6, "bbb"), (6, 9, "ccc")]
+    assert core._select([_candidate(3, 6, "bbb", either)], never) == []
 
 
-def test_resolve_chains_needs_supporters_of_three_letters():
+def test_select_needs_supporters_of_three_letters():
     never = lambda index: False  # noqa: E731
     either = ((True, False), (False, True))
-    # A two-letter candidate supports nothing, so its neighbour falls too.
-    assert core._resolve_chains([(0, 2, "zu", either), (2, 6, "speck", either)], never) == []
-    assert core._resolve_chains([(0, 3, "zuu", either), (3, 7, "speck", either)], never) == [(0, 3, "zuu"), (3, 7, "speck")]
+    # A two-letter candidate that needs a neighbour supports nothing, so its
+    # neighbour falls too; one that stands alone supports its neighbours.
+    assert core._select([_candidate(0, 2, "zu", either), _candidate(2, 6, "speck", either)], never) == []
+    assert _spans(core._select([_candidate(0, 3, "zuu", either), _candidate(3, 7, "speck", either)], never)) == [
+        (0, 3, "zuu"),
+        (3, 7, "speck"),
+    ]
+    assert _spans(core._select([_candidate(0, 2, "zu"), _candidate(2, 6, "speck", either)], never)) == [
+        (0, 2, "zu"),
+        (2, 6, "speck"),
+    ]
+
+
+def test_select_tie_breaks():
+    never = lambda index: False  # noqa: E731
+    # Reported characters first, then all characters covered ...
+    assert _spans(core._select([_candidate(0, 7, "long", reported=False), _candidate(1, 7, "short")], never)) == [(1, 7, "short")]
+    assert _spans(core._select([_candidate(0, 7, "long"), _candidate(1, 7, "short")], never)) == [(0, 7, "long")]
+    assert _spans(core._select([_candidate(0, 3, "aaa"), _candidate(2, 8, "bbb"), _candidate(3, 8, "ccc")], never)) == [
+        (0, 3, "aaa"),
+        (3, 8, "ccc"),
+    ]
+    # ... then the fewest matches, the earliest, and the earliest expression.
+    assert _spans(core._select([_candidate(0, 3, "aaa"), _candidate(3, 6, "bbb"), _candidate(0, 6, "ab")], never)) == [(0, 6, "ab")]
+    assert _spans(core._select([_candidate(1, 4, "late"), _candidate(0, 3, "early")], never)) == [(0, 3, "early")]
+    assert _spans(core._select([_candidate(0, 3, "two", order=2), _candidate(0, 3, "one", order=1)], never)) == [(0, 3, "one")]
+
+
+def test_select_covers_required_positions():
+    never = lambda index: False  # noqa: E731
+    required = bytearray(10)
+    required[2:4] = b"\x01\x01"
+    hit = _candidate(2, 4, "hit", order=-1, reported=False)
+    # A required span is covered by itself, or by a longer candidate containing
+    # it, even when that loses reported characters elsewhere.
+    assert _spans(core._select([hit, _candidate(0, 3, "abc")], never, required)) == [(2, 4, "hit")]
+    assert _spans(core._select([hit, _candidate(1, 6, "wide")], never, required)) == [(1, 6, "wide")]
 
 
 STRATEGY_TEXTS = [
@@ -478,6 +520,14 @@ def test_given_back_letters_need_a_glued_follower():
     expression = re.compile(r"xy(?: y)?")
     found = core._end_before_profanity(expression, "xxy y", 0, 2, "xx", frozenset(), 10, 100, re.compile("x"))
     assert found is None
+
+
+def test_an_empty_retry_is_never_selected():
+    # The retry before the word gap of "ab cd" (which runs into "x") is the
+    # empty match of this custom expression.
+    shield = _with_extra_expressions(ProfanityFilter(block=["zz-empty-retry"]), ("zz-ab", re.compile("(?:ab cd)?")))
+    result = _within(30, shield.check, "xab cdx shit")
+    assert result.clean == "xab cdx ****"
 
 
 def test_a_shortened_candidate_is_still_checked_for_hex_tokens():

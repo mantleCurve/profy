@@ -1,5 +1,76 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, match-selection redesign + Codex review pass 11)
+- Selection redesign (Codex pass 10 assessment): check() no longer accepts
+  candidates one at a time in expression order. Per pass, every finditer()
+  match of every expression yields readings (`_readings`): the match, the
+  give-back reading for a copy that follows (`_end_before_profanity`, now
+  tried on the raw match before the bleed guards, and followers may hold
+  whitespace: "soltar pedoss|oltar pedos"), readings starting later in a
+  stretched run of the first letter ("as|sshit"; a double is the word's own:
+  "git|tite"), and the copies such readings free (follows). The bleed guards
+  judge each reading (`_unbled`: cross-word retry, joined-word cut); the
+  per-reading guards (elision, hex, Scunthorpe, false positives) in
+  `evaluate`; a reading the Scunthorpe guard protects keeps its
+  `_chain_needs` alternatives. `_select` then picks the non-overlapping set
+  by DP over the readings sorted by start (4 states: a supporter ends here /
+  the reading ending here still needs its right neighbour), linear in the
+  number of readings. Order: reported letters+digits, letters+digits,
+  reported and all characters that spell something (letter symbols; not
+  whitespace or separators no letter stands for), fewest matches, expression
+  order, start offsets; one big-int score per set.
+- Deleted: contained()/replace() takeovers, `_Accepted` records, owners
+  array, pending/pending_lengths/deferred, `_resolve_chains`, the give-back
+  takeover by prefix entries and other spellings (`_ExpressionInfo.takeovers`,
+  `expressions_of`, prefix tuples and cache), the in-word replacement guard,
+  the hex re-check after shortening, the separate "clos|clos" branch (folded
+  into `_end_before_profanity`), `_CandidateFinder._full`,
+  `_Dictionary.unelided` (now in `_ExpressionInfo.elision`) and `_ordering`.
+  core.py 1249 -> 1220 statements, 520 -> 498 branches; check() 202 -> 90
+  statements (the bleed guards moved to `_readings`/`_unbled`, unchanged).
+  Measured and kept: `_DISCARD` (without it +290 fragment matches across
+  separators inside words, "verdam-mt"), the confirming pass (single pass:
+  sweep failures English 524 -> 1996, Spanish 2 -> 57).
+- Guards the selection needed: a reading starting inside a word and crossing
+  whitespace is a fragment when the part in that word has fewer than two
+  letters/digits or nothing after the whitespace holds a letter
+  ("cabron|a $Naa" as asna, "nichon|s* Nson" as con, "shit|s hit",
+  "bourrin|es @" as ecu; greedy order used to hide these); main and r11
+  agree on every such example.
+- P2 (Codex pass 11) literal block entries vs longer matches: block hits are
+  candidates (expression number -1, exempt from guards) the first pass must
+  cover (`required`), by themselves or by a containing reading; readings
+  overlapping one only partly are left out (`splits_a_hit`). A containing
+  reading is the one reported. Hits a shortened run folds together are
+  merged into one hit as the most severe entry ("$" * 14, block "$$$","$$").
+  "n!gger" block "!" at extreme: extreme match; "ass hole" block "ass":
+  asshole; "a!ss" block "!" at high: the entry's own "!".
+- P2 (Codex pass 11) long block entries vs stretched words: block entries no
+  longer feed `_RunShortener` (their text is found before shortening);
+  property test with random letters and lengths up to 300.
+- Latent hang fixed (custom expressions only, r11 too): an empty cross-word
+  retry restarted its follow at the candidate's own start.
+- Intended test changes: `test_a_containing_match_keeps_the_more_severe_report`
+  -> `test_overlapping_readings_prefer_reported_then_covered_characters`
+  ("whooore" is one moderate "whore" by default; still "w******" at high);
+  `_resolve_chains` unit tests -> `_select` tests (same scenarios, plus
+  tie-breaks and required coverage); KNOWN_REPEAT_FAILURES 14 -> 3 (all three
+  fail in r11 too).
+- Differential vs r11 (HEAD 101c9df), all 40 corpus runs: 0 lost; 33 gained
+  (all cross-language, German "zu" read from "**u" where r11 already reported
+  "po" on the "**"); native masks 139 grown (mostly inflected compounds:
+  "fuckbitching", "tittyfuckers"), 19 shifted, 3 shrunk (r6 "cockass -
+  cockass" no longer masks the " - " between copies; one split-corpus tie).
+  Sweep (excluding ordinary doubles) r11 -> now: English 960 -> 524, German
+  373 -> 232, French 255 -> 31, Spanish 14 -> 2 (1602 -> 789).
+  Dictionary scan: 845, identical set and masks. Windowed/compacted vs full
+  rescan: 0 diffs over 65,903 texts x 3 strategies x 4 languages.
+- Timing vs r11: prose throughput and tiny-check latency within 1%;
+  adversarial worst case "* " * 200 English 0.39s -> 0.43s, all languages
+  0.76s -> 0.83s (budget 2s); scaling ratios all ~x4. Hot `re.*` calls in the
+  per-candidate guards are precompiled; a raw match inside a hex-like token
+  is skipped before its readings are generated.
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 10)
 - P1 takeover leak: the give-back takeover (`base, expression = entry`)
   rebound the expression loop's variables, so later matches of the scanned

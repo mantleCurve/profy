@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from enum import Enum
@@ -199,6 +200,8 @@ class ProfanityFilter:
             return _repeats(*token_roots[token], base)
 
         matches: list[Match] = []
+        # Matches withdrawn for a longer one that contains them (see replace).
+        withdrawn: set[int] = set()
         # Original characters already claimed by a match (several normalized
         # characters can come from one original character).
         claimed = bytearray(len(original))
@@ -227,6 +230,15 @@ class ProfanityFilter:
             taken = bytearray(len(working))
             accepted: list[tuple[int, int]] = []
             pending: list[tuple[int, int, str, tuple[tuple[bool, bool], ...]]] = []
+            # Per accepted match: severity, whether it is an explicit block
+            # entry's own text, and its reported Match; and per position of
+            # ``working``, which accepted match (1-based) holds it.
+            records: list[tuple[Severity, bool, Optional[Match]]] = []
+            owners = array("i")
+            # Per position, the longest pending candidate covering it (capped at
+            # 255), and the shorter candidates waiting for those to be resolved.
+            pending_lengths = bytearray()
+            deferred: list[tuple[int, int, str]] = []
 
             def masked(index: int) -> bool:
                 return 0 <= index < len(working) and (working[index] == "\x01" or bool(taken[index]))
@@ -238,11 +250,15 @@ class ProfanityFilter:
                     and working[word_start:word_end].lower() in dictionary.false_positives
                 )
 
-            def accept(start: int, end: int, base: str) -> None:
+            def accept(start: int, end: int, base: str, exact: bool = False) -> None:
                 taken[start:end] = b"\x01" * (end - start)
+                if not owners:
+                    owners.frombytes(bytes(owners.itemsize * len(working)))
+                owners[start:end] = array("i", [len(accepted) + 1]) * (end - start)
                 accepted.append((start, end))
 
                 severity = dictionary.severity_for(base)
+                records.append((severity, exact, None))
                 if self.minimum_severity is not None and not severity.is_at_least(self.minimum_severity):
                     return
                 original_start, original_end = _original_span(working_map, start, end)
@@ -253,16 +269,59 @@ class ProfanityFilter:
                 if claimed.find(1, original_start, original_end) != -1:
                     return
                 claimed[original_start:original_end] = b"\x01" * (original_end - original_start)
-                matches.append(
-                    Match(
-                        text=original[original_start:original_end],
-                        base=base,
-                        severity=severity,
-                        position=original_start,
-                        length=original_end - original_start,
-                        language=",".join(self.languages),
-                    )
+                match = Match(
+                    text=original[original_start:original_end],
+                    base=base,
+                    severity=severity,
+                    position=original_start,
+                    length=original_end - original_start,
+                    language=",".join(self.languages),
                 )
+                matches.append(match)
+                records[-1] = (severity, exact, match)
+
+            def contained(start: int, end: int) -> Optional[list[int]]:
+                """This pass's accepted matches overlapping [start, end) when all
+                lie strictly inside it and none is an explicit block entry's
+                own text, else None."""
+                inside: list[int] = []
+                position = taken.find(1, start, end)
+                while position != -1:
+                    index = owners[position] - 1
+                    first, last = accepted[index]
+                    if first < start or last > end or (first, last) == (start, end) or records[index][1]:
+                        return None
+                    inside.append(index)
+                    position = taken.find(1, last, end)
+                return inside
+
+            def replace(inside: list[int], base: str, exact: bool = False) -> bool:
+                """Withdraw the matches ``inside`` for one that contains them
+                ("w|hooore" for "whooore"), unless one of them is more severe
+                (an explicit block entry's own text replaces them anyway)."""
+                severity = dictionary.severity_for(base)
+                if not exact and any(records[index][0].weight > severity.weight for index in inside):
+                    return False
+                for index in inside:
+                    first, last = accepted[index]
+                    taken[first:last] = bytes(last - first)
+                    accepted[index] = (first, first)
+                    match = records[index][2]
+                    if match is not None:
+                        claimed[match.position : match.position + match.length] = bytes(match.length)
+                        withdrawn.add(id(match))
+                return True
+
+            def follow_from(new_end: int, old_end: int) -> None:
+                # A shortened candidate frees letters finditer() has already
+                # passed; the current expression's next match may start in them
+                # ("shit-ass|,shit-ass" after "shit-ass,s"). At most as many
+                # starts as the longest entry has letters are tried.
+                for position in range(new_end, min(old_end, new_end + dictionary.longest_word)):
+                    follow = expression.match(working, position)
+                    if follow is not None and follow.end() > position:
+                        stack.append((position, follow.end(), follow.group(0)))
+                        return
 
             for number, (base, expression) in enumerate(expressions):
                 if finder.mode == "full":
@@ -270,115 +329,216 @@ class ProfanityFilter:
                 else:
                     candidates = finder.candidates(expression, previous.get(number))
                 previous[number] = candidates
-                for start, end, matched_text in candidates:
-                    # An explicit block entry's own text is masked whatever the
-                    # heuristics below would say about it.
-                    exact = base in dictionary.blocked and is_exact_block(start, end, base)
-
-                    if exact:
-                        pass
-                    elif _is_spanning_word_boundary(matched_text, working, start):
-                        # Rejected for running into the next word ("hell, Ll|oyd",
-                        # "hell - Ll|oyd"); the same profanity may still match
-                        # before the gap between the words.
-                        retry = _retry_before_word_gap(expression, working, start, matched_text)
-                        if retry is None:
-                            continue
-                        end = retry.end()
-                        matched_text = retry.group(0)
-                    else:
-                        # Through symbols into the first letters of a joined word
-                        # ("hell-Ll|oyd"): the profanity before the symbols is
-                        # retried alone, and when only another entry spells the
-                        # word before them ("shit-t|om" read as "shitt"), that
-                        # entry gets it.
-                        cut = _joined_word_cut(
-                            expression,
-                            matched_text,
-                            working,
-                            start,
-                            end,
-                            dictionary.words,
-                            dictionary.longest_word,
-                            dictionary.compound_parts,
-                        )
-                        if cut is not None:
-                            retry = expression.match(working, start, start + cut)
-                            if retry is not None and not _is_spanning_word_boundary(retry.group(0), working, start):
-                                end = retry.end()
-                                matched_text = retry.group(0)
-                            elif matched_text[:cut].lower() in dictionary.words:
+                for candidate in candidates:
+                    # A candidate may give back its end to the next occurrence
+                    # (see _end_before_profanity), which is then judged next.
+                    stack = [candidate]
+                    while stack:
+                        start, end, matched_text = stack.pop()
+                        # An explicit block entry's own text is masked whatever the
+                        # heuristics below would say about it.
+                        exact = base in dictionary.blocked and is_exact_block(start, end, base)
+                        candidate_text = matched_text
+                        if not exact and _HEX_RUN.fullmatch(matched_text):
+                            # Inside one hex-like token every shorter reading lies in
+                            # it too: the hex/UUID guard decides before anything else.
+                            token = hex_runs.around(start, end)
+                            if token not in hex_verdicts:
+                                hex_verdicts[token] = _is_hex_token(working[token[0] : token[1]])
+                            if hex_verdicts[token]:
                                 continue
 
-                    # A match that only exists by leaving the vowel out must spell
-                    # every consonant ("fck", "f--ck", "$ht"); a character any of
-                    # the word's letters accepts spells none ("*Ll|oyd" as "hll").
-                    elided = dictionary.elided.get(base)
-                    if (
-                        not exact
-                        and elided is not None
-                        and not _spells(matched_text, *elided)
-                        and not dictionary.unelided(base).fullmatch(working, start, end)
-                    ):
-                        continue
+                        if exact:
+                            pass
+                        elif _is_spanning_word_boundary(
+                            matched_text, working, start, dictionary.compound_parts, window, expression, dictionary.longest_match
+                        ):
+                            # Rejected for running into the next word ("hell, Ll|oyd",
+                            # "hell - Ll|oyd"); the same profanity may still match
+                            # before the gap between the words.
+                            retry = _retry_before_word_gap(
+                                expression, working, start, matched_text, dictionary.compound_parts, window
+                            )
+                            if retry is None:
+                                continue
+                            follow_from(start + retry.end(), end)
+                            end = start + retry.end()
+                            matched_text = retry.group(0)
+                        else:
+                            # Through symbols into the first letters of a joined word
+                            # ("hell-Ll|oyd"): the profanity before the symbols is
+                            # retried alone, and when only another entry spells the
+                            # word before them ("shit-t|om" read as "shitt"), that
+                            # entry gets it.
+                            cut = _joined_word_cut(
+                                expression,
+                                matched_text,
+                                working,
+                                start,
+                                end,
+                                dictionary.words,
+                                dictionary.longest_word,
+                                dictionary.compound_parts,
+                                dictionary.joined,
+                            )
+                            if cut == _DISCARD:
+                                continue
+                            if cut is not None:
+                                retry = expression.match(working[start : start + cut])
+                                if retry is not None and not _is_spanning_word_boundary(
+                                    retry.group(0), working, start, dictionary.compound_parts, window
+                                ):
+                                    follow_from(start + retry.end(), end)
+                                    end = start + retry.end()
+                                    matched_text = retry.group(0)
+                                elif matched_text[:cut].lower() in dictionary.words or any(
+                                    prefix.fullmatch(matched_text[:cut]) for prefix in dictionary.prefix_expressions(base)
+                                ):
+                                    # Another entry spells the word before the symbols
+                                    # ("shit-t|om" read as "shitt", "sluut,s|luut" as
+                                    # "sluts"): that entry gets it.
+                                    continue
 
-                    # A zero-length match can never be masked and would keep the
-                    # scan loop alive forever, so it is never accepted. Masked
-                    # characters (\x01) and this pass's matches are never reused.
-                    if start == end or "\x01" in matched_text or taken.find(1, start, end) != -1:
-                        continue
-                    if exact:
-                        keep_scanning = True
-                        accept(start, end, base)
-                        continue
-                    token = hex_runs.around(start, end)
-                    if token not in hex_verdicts:
-                        hex_verdicts[token] = _is_hex_token(working[token[0] : token[1]])
-                    if hex_verdicts[token]:
-                        continue
+                        if not exact and end < len(working) and not working[end].isspace():
+                            # A stretched run at the end may hold the first letter of a
+                            # profanity that follows ("twatt|wat"): ending before it
+                            # leaves that occurrence whole.
+                            info = dictionary.info(base, expression)
+                            given_back = _end_before_profanity(
+                                expression,
+                                working,
+                                start,
+                                end,
+                                matched_text,
+                                dictionary.compound_parts,
+                                window,
+                                dictionary.longest_match,
+                                info.first,
+                                info.takeovers,
+                                info.wildcards,
+                            )
+                            if given_back is not None:
+                                shorter, follow, entry = given_back
+                                end = start + shorter.end()
+                                matched_text = shorter.group(0)
+                                if entry is not None:
+                                    # The rest of this candidate is judged as that entry.
+                                    base, expression = entry
+                                if follow is not None and follow.end():
+                                    stack.append((end, end + follow.end(), follow.group(0)))
+                            elif (
+                                working[end].lower() not in info.wildcards
+                                and info.first.match(working, end)
+                                and not expression.match(working, end)
+                            ):
+                                # The next occurrence may start where the start guard
+                                # refuses it, when this match's last letter can also
+                                # be its first ("clos|clos" in French, where "c"
+                                # stands for "s" too): finditer() would skip it.
+                                follow = expression.match(working[end : end + min(dictionary.longest_match, 4 * (end - start) + 16)])
+                                if follow is not None and follow.end() and not _SPACE.search(follow.group(0)):
+                                    stack.append((end, end + follow.end(), follow.group(0)))
 
-                    # For the Scunthorpe-style substring guard we use the
-                    # surrounding *alphabetic run* rather than the full \w-context.
-                    # A trailing/leading digit (e.g. "hello9") must not strip the
-                    # protection that keeps a real word like "hello" from being
-                    # masked just because it contains the profanity "hell".
-                    word_start, word_end = letters.around(start, end)
-                    guard = (
-                        matched_text,
-                        immutable_normalized[max(word_start, start - window) : start],
-                        immutable_normalized[end : min(word_end, end + window)],
-                        base,
-                        dictionary.compound_parts,
-                    )
-                    # Directly touching an accepted match also makes a compound
-                    # ("biitch|fuck", where "biitch" is no literal entry).
-                    touches_before = masked(start - 1)
-                    touches_after = masked(end)
-                    if _is_pure_alpha_substring(*guard, touches_before=touches_before, touches_after=touches_after):
-                        # It may still be one link of a chain of candidates that
-                        # only qualify together ("biitch|biitch"); see below.
-                        needs = _chain_needs(guard, touches_before, touches_after)
-                        if needs and base in dictionary.elided and not dictionary.unelided(base).fullmatch(working, start, end):
-                            # Without its vowel, a candidate inside a longer word is
-                            # just letters of it ("ngr" in "sangreeroot"): it only
-                            # counts with a word edge or a match on both sides
-                            # ("sht|dck").
-                            needs = ((bool(guard[1]) and not touches_before, bool(guard[2]) and not touches_after),)
-                        if needs and not is_false_positive(start, end):
-                            pending.append((start, end, base, needs))
-                    elif not is_false_positive(start, end):
-                        keep_scanning = True
-                        accept(start, end, base)
+                        # A match that only exists by leaving the vowel out must spell
+                        # every consonant ("fck", "f--ck", "$ht"); a character any of
+                        # the word's letters accepts spells none ("*Ll|oyd" as "hll").
+                        elided = dictionary.info(base, expression).elision
+                        if (
+                            not exact
+                            and elided is not None
+                            and not _spells(matched_text, *elided)
+                            and not dictionary.unelided(base, expression).fullmatch(matched_text)
+                        ):
+                            continue
+
+                        # A zero-length match can never be masked and would keep the
+                        # scan loop alive forever, so it is never accepted. Masked
+                        # characters (\x01) and this pass's matches are never reused.
+                        if start == end or "\x01" in matched_text:
+                            continue
+                        # A candidate may only take letters this pass already
+                        # matched by containing those matches entirely.
+                        inside = contained(start, end) if taken.find(1, start, end) != -1 else []
+                        if inside is None:
+                            continue
+                        if inside and not exact and start and _ALPHANUMERIC.match(working, start - 1):
+                            # Starting inside a word it would also cut off the match
+                            # its first letters belong to ("a|sscck" for "ass|cck").
+                            continue
+                        if exact:
+                            replace(inside, base, exact=True)
+                            keep_scanning = True
+                            accept(start, end, base, exact=True)
+                            continue
+                        if matched_text != candidate_text:
+                            # Shortened above, it may now lie in a hex-like token.
+                            token = hex_runs.around(start, end)
+                            if token not in hex_verdicts:
+                                hex_verdicts[token] = _is_hex_token(working[token[0] : token[1]])
+                            if hex_verdicts[token]:
+                                continue
+
+                        # For the Scunthorpe-style substring guard we use the
+                        # surrounding *alphabetic run* rather than the full \w-context.
+                        # A trailing/leading digit (e.g. "hello9") must not strip the
+                        # protection that keeps a real word like "hello" from being
+                        # masked just because it contains the profanity "hell".
+                        word_start, word_end = letters.around(start, end)
+                        guard = (
+                            matched_text,
+                            immutable_normalized[max(word_start, start - window) : start],
+                            immutable_normalized[end : min(word_end, end + window)],
+                            base,
+                            dictionary.compound_parts,
+                        )
+                        # Directly touching an accepted match also makes a compound
+                        # ("biitch|fuck", where "biitch" is no literal entry).
+                        touches_before = masked(start - 1)
+                        touches_after = masked(end)
+                        if _is_pure_alpha_substring(*guard, touches_before=touches_before, touches_after=touches_after):
+                            # It may still be one link of a chain of candidates that
+                            # only qualify together ("biitch|biitch"); see below.
+                            needs = _chain_needs(guard, touches_before, touches_after)
+                            if (
+                                needs
+                                and dictionary.info(base, expression).elision is not None
+                                and not dictionary.unelided(base, expression).fullmatch(matched_text)
+                            ):
+                                # Without its vowel, a candidate inside a longer word is
+                                # just letters of it ("ngr" in "sangreeroot"): it only
+                                # counts with a word edge or a match on both sides
+                                # ("sht|dck").
+                                needs = ((bool(guard[1]) and not touches_before, bool(guard[2]) and not touches_after),)
+                            if needs and not inside and not is_false_positive(start, end):
+                                pending.append((start, end, base, needs))
+                                if not pending_lengths:
+                                    pending_lengths.extend(bytes(len(working)))
+                                length = min(end - start, 255)
+                                pending_lengths[start:end] = bytes(max(item, length) for item in pending_lengths[start:end])
+                        elif not is_false_positive(start, end):
+                            if pending_lengths and max(pending_lengths[start:end]) > end - start:
+                                # A longer candidate waiting for its chain gets these
+                                # letters first ("baastard|baastard", not "baas|tard").
+                                deferred.append((start, end, base))
+                            elif replace(inside, base):
+                                keep_scanning = True
+                                accept(start, end, base)
 
             # Accept the chains of protected candidates whose missing neighbours
             # are each other ("biitch|biitch", "biitch|biitch|fuck").
             for start, end, base in _resolve_chains(pending, masked):
                 keep_scanning = True
                 accept(start, end, base)
+            for start, end, base in deferred:
+                if taken.find(1, start, end) == -1:
+                    keep_scanning = True
+                    accept(start, end, base)
 
+            accepted = [span for span in accepted if span[0] < span[1]]
             working = _mask_spans(working, accepted)
             changed = sorted(accepted)
 
+        matches = [match for match in matches if id(match) not in withdrawn]
         return ShieldResult(original, self._apply_masks(original, matches), tuple(matches), _score(matches, text))
 
     def clean(self, text: Optional[str]) -> str:
@@ -506,6 +666,9 @@ class _Dictionary:
         # far around a match the substring guard needs to look.
         self.words = frozenset(word.lower() for word in profanities)
         self.longest_word = max([0] + [len(word) for word in self.words])
+        # The most characters one match can span: every letter a full run plus
+        # a separator gap.
+        self.longest_match = (self.longest_word + 1) * (_RUN_LENGTH_LIMIT + _SEPARATOR_LIMIT)
         self.compound_parts = frozenset(word for word in self.words if len(word) >= _COMPOUND_PART_MINIMUM)
         self.context_window = max([len(part) for part in self.compound_parts] + [_LONGEST_SUFFIX + 1])
         self.longest_false_positive = max([0] + [len(word) for word in self.false_positives])
@@ -513,6 +676,7 @@ class _Dictionary:
         # keyed by id(): hashing a compiled pattern re-hashes its whole program.
         # The expressions live as long as this dictionary, so ids stay unique.
         self.stops: dict[int, re.Pattern[str]] = {}
+        variants = []
         if driver == "pattern":
             self.expressions = _generate_literal_expressions(profanities)
         else:
@@ -522,18 +686,64 @@ class _Dictionary:
             # words only lengthen the runs of their own characters (a block word
             # "x" * 300 must not keep "u" runs too long to match "fuu...ck").
             ordered = _ordered_substitutions(substitutions)
-            # Words whose vowel may be left out: how many positions besides the
-            # vowel they have ("ck" in German "sack" is one), the characters
-            # that spell one of their letters, and their expression without
-            # that option.
-            self.elided: dict[str, tuple[int, frozenset]] = {}
+            # A word spelled with a multi-letter key ("sch", "ck", "ll") also
+            # gets an expression with a token per letter, so each letter of the
+            # key can be obfuscated or stretched on its own ("5chwuler",
+            # "schhmaehlich"); the key's own options only cover it whole.
+            # Keys the language's normalization rewrites in the text (see
+            # _NORMALIZED_KEYS) stay whole or get an optional letter.
+            rewritten = _NORMALIZED_KEYS.get(languages[0], {}) if len(languages) == 1 else {}
+            single = tuple(item for item in ordered if len(item[0]) == 1 or item[0] in rewritten and rewritten[item[0]] is None)
+            self._orderings = {id(expression): ordered for expression in self.expressions.values()}
+            self._optionals: dict[int, tuple[int, ...]] = {}
+            variants: list[tuple[str, re.Pattern[str]]] = []
+            variant_tokens: list[tuple[str, tuple[_Token, ...]]] = []
+            if single != ordered:
+                for word in profanities:
+                    lowered = word.lower()
+                    optional = tuple(
+                        index + offset
+                        for key, offset in rewritten.items()
+                        if offset is not None
+                        for index in range(len(lowered))
+                        if lowered.startswith(key, index)
+                    )
+                    tokens = _tokenize(word, single, True, optional)
+                    if tokens != _tokenize(word, ordered):
+                        expression, stop = _compile_profanity(word, single, tuple(separators), True, optional)
+                        variants.append((word, expression))
+                        variant_tokens.append((word, tokens))
+                        self.stops[id(expression)] = stop
+                        self._orderings[id(expression)] = single
+                        self._optionals[id(expression)] = optional
+            self._ordered = ordered
+            self._separators = tuple(separators)
+            self._prefixes: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {}
+            self._expressions_of: dict[str, tuple[re.Pattern[str], ...]] = {}
+            # Keyed by id() like the stop classes (the expressions live as long).
+            self._infos: dict[int, _ExpressionInfo] = {}
+            for word, expression in list(self.expressions.items()) + variants:
+                self._expressions_of[word] = self._expressions_of.get(word, ()) + (expression,)
+            self._entries_by_lower: dict[str, list[str]] = {}
             for word in profanities:
-                if _is_elidable(word):
-                    tokens = _tokenize(word, ordered)
-                    self.elided[word] = (sum(1 for token in tokens if not token.optional), _spelling_characters(tokens))
-            self._compile_arguments = (ordered, tuple(separators))
+                self._entries_by_lower.setdefault(word.lower(), []).append(word)
+            # Separators no letter stands for ("-", ",", "_" but not "*", "!"),
+            # and the reversed tail of a joined match (see _joined_word_cut).
+            substitutes = {
+                character.lower()
+                for key, options in ordered
+                for text in (key, *options)
+                for character in (text[1:] if re.fullmatch(r"\\.", text) else text)
+            }
+            pure = [character for character in separators if character.lower() not in substitutes] + ["_"]
+            members = "".join(_class_members(pure))
+            self.joined = (
+                re.compile("[" + members + "]"),
+                re.compile(r"([^\s" + members + r"]+)([" + members + r"]+)"),
+                re.compile(r"[^\s" + members + r"]+"),
+            )
             self.runs = _RunShortener(
-                {word: _tokenize(word, ordered) for word in profanities},
+                [(word, _tokenize(word, ordered)) for word in profanities] + variant_tokens,
                 separators,
                 _longest_needed_run(bundled, substitutions),
             )
@@ -541,8 +751,16 @@ class _Dictionary:
         # first, so it always matches its own text ("*6zy" before "fagz").
         blocked = frozenset(blocked)
         self.blocked = blocked
+        # A word's per-letter variant goes before its expression with
+        # multi-letter keys: it reads every spelling the other reads in the
+        # normalized text, and more ("5cheiss" whole, not "5|cheiss").
+        variant_ids = {id(expression) for _, expression in variants}
         self.sorted_expressions = tuple(
-            sorted(self.expressions.items(), key=lambda item: (len(item[0]), item[0] in blocked), reverse=True)
+            sorted(
+                list(self.expressions.items()) + (variants if driver != "pattern" else []),
+                key=lambda item: (len(item[0]), item[0] in blocked, id(item[1]) in variant_ids),
+                reverse=True,
+            )
         )
 
     @classmethod
@@ -607,9 +825,65 @@ class _Dictionary:
             bundled=bundled,
         )
 
-    def unelided(self, word: str) -> re.Pattern[str]:
-        """The expression of an elidable ``word`` with its vowel required."""
-        return _compile_profanity(word, *self._compile_arguments, False)[0]
+    def info(self, word: str, expression: re.Pattern[str]) -> "_ExpressionInfo":
+        """What the scan needs to know about ``expression`` (one of ``word``'s),
+        computed once: see _ExpressionInfo."""
+        info = self._infos.get(id(expression))
+        if info is None:
+            tokens = _tokenize(word, self._ordering(expression), True, self._optionals.get(id(expression), ()))
+            if not tokens:
+                # Not a generated expression: any character may start it.
+                first = re.compile(r"[\s\S]")
+            elif tokens[0].literal is not None:
+                first = re.compile(re.escape(tokens[0].literal), re.IGNORECASE | re.UNICODE)
+            else:
+                first = _class_pattern(tokens[0].chars | {option[0] for option in tokens[0].multi})
+            classes = [frozenset(character.lower() for character in token.chars) for token in tokens if token.literal is None]
+            elision = None
+            if _is_elidable(word):
+                # Positions besides the vowel ("ck" in German "sack" is one).
+                elision = (sum(1 for token in tokens if not token.optional), _spelling_characters(tokens))
+            takeovers = tuple((word, other) for other in self.expressions_of(word) if other is not expression)
+            info = _ExpressionInfo(
+                first,
+                frozenset.intersection(*classes) if classes else frozenset(),
+                elision,
+                takeovers + self.prefix_entries(word),
+            )
+            self._infos[id(expression)] = info
+        return info
+
+    def _ordering(self, expression: re.Pattern[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        # The keys an expression was built with (custom ones: the dictionary's).
+        return self._orderings.get(id(expression), self._ordered)
+
+    def prefix_entries(self, word: str) -> tuple[tuple[str, re.Pattern[str]], ...]:
+        """The entries ``word`` starts with ("slut" for "sluts"), longest
+        first, with their expressions; cached."""
+        prefixes = self._prefixes.get(word)
+        if prefixes is None:
+            lowered = word.lower()
+            prefixes = tuple(
+                (entry, self.expressions[entry])
+                for size in range(len(word) - 1, 2, -1)
+                for entry in self._entries_by_lower.get(lowered[:size], ())
+            )
+            self._prefixes[word] = prefixes
+        return prefixes
+
+    def expressions_of(self, word: str) -> tuple[re.Pattern[str], ...]:
+        """Every expression of ``word`` (see the per-letter variants)."""
+        return self._expressions_of.get(word, ())
+
+    def prefix_expressions(self, word: str) -> tuple[re.Pattern[str], ...]:
+        """The expressions of ``prefix_entries``."""
+        return tuple(expression for _, expression in self.prefix_entries(word))
+
+    def unelided(self, word: str, expression: re.Pattern[str]) -> re.Pattern[str]:
+        """``expression`` (one of the elidable ``word``'s) with the vowel
+        required."""
+        optional = self._optionals.get(id(expression), ())
+        return _compile_profanity(word, self._ordering(expression), self._separators, False, optional)[0]
 
     def severity_for(self, word: str) -> Severity:
         return self.severity_map.get(word.lower(), Severity.HIGH)
@@ -637,7 +911,8 @@ class _Dictionary:
             normalized, span_map = _replace_with_mapping(
                 normalized,
                 span_map,
-                r"rr",
+                # A whole run, so a stretched "rrr" is no ordinary double "rr".
+                r"r{2,}",
                 lambda match: _case_like(match.group(0), "r"),
             )
         elif self.languages == ["german"]:
@@ -645,7 +920,8 @@ class _Dictionary:
             normalized, span_map = _replace_with_mapping(
                 normalized,
                 span_map,
-                r"sch",
+                # Stretched too ("sschhh"), so a doubled letter is no new word.
+                r"s+c+h+",
                 lambda match: _case_like(match.group(0), "sh"),
             )
         elif self.languages == ["french"]:
@@ -675,6 +951,20 @@ def _longest_needed_run(profanities: Iterable[str], substitutions: Mapping[str, 
 _LONG_RUN = re.compile(r"(.)\1{3,}", re.DOTALL)
 _REPEATED = re.compile(r"(.)\1+", re.DOTALL)
 _WORD_CHARACTER = re.compile(r"\w")
+
+
+class _ExpressionInfo(NamedTuple):
+    """Per expression: the characters it can start with; those every letter
+    of it accepts ("*"); for a word whose vowel may be left out, how many
+    positions besides the vowel it has and the characters that spell one of
+    its letters (else None); and the expressions that may take over a
+    given-back match (the word's other spellings, then the entries it starts
+    with)."""
+
+    first: re.Pattern[str]
+    wildcards: frozenset
+    elision: Optional[tuple[int, frozenset]]
+    takeovers: tuple[tuple[str, re.Pattern[str]], ...]
 
 
 class _RunShortener:
@@ -708,11 +998,11 @@ class _RunShortener:
     occurrences stay complete.
     """
 
-    def __init__(self, tokenized: Mapping[str, tuple[_Token, ...]], separators: Iterable[str], floor: int) -> None:
+    def __init__(self, tokenized: list[tuple[str, tuple[_Token, ...]]], separators: Iterable[str], floor: int) -> None:
         classes: set[frozenset] = set()
         literals: set[str] = set()
         options: set[str] = set()
-        for token in set(chain.from_iterable(tokenized.values())):
+        for token in set(chain.from_iterable(tokens for _, tokens in tokenized)):
             if token.literal is not None:
                 literals.add(token.literal)
                 continue
@@ -747,11 +1037,12 @@ class _RunShortener:
         # Word characters by class; one no expression reads (a key none of its
         # own options spells) stays itself.
         table = {
-            ord(character): self._representative(character) or character for character in set("".join(tokenized))
+            ord(character): self._representative(character) or character
+            for character in set("".join(word for word, _ in tokenized))
         }
         needed: dict[str, int] = {}
         periods: dict[str, int] = {}
-        for word, tokens in tokenized.items():
+        for word, tokens in tokenized:
             repeats = list(_REPEATED.finditer(word.translate(table)))
             for repeat in repeats:
                 needed[repeat.group(1)] = max(needed.get(repeat.group(1), 0), len(repeat.group(0)))
@@ -914,9 +1205,10 @@ def _compile_profanity(
     ordered: tuple[tuple[str, tuple[str, ...]], ...],
     separators: tuple[str, ...],
     elide: bool = True,
+    optional: tuple[int, ...] = (),
 ) -> tuple[re.Pattern[str], re.Pattern[str]]:
-    """The expression for one profanity and its *stop* class (``elide``: see
-    ``_tokenize``).
+    """The expression for one profanity and its *stop* class (``elide`` and
+    ``optional``: see ``_tokenize``).
 
     The stop class matches every character that no part of the expression can
     consume or test positively: all token classes, multi-character options and
@@ -927,7 +1219,7 @@ def _compile_profanity(
     is the first stop character at or after ``p``. The confirming passes rely
     on this to rescan only where masking changed the text.
     """
-    tokens = _tokenize(profanity, ordered, elide)
+    tokens = _tokenize(profanity, ordered, elide, optional)
     readable: set[str] = set(separators)
     for token in tokens:
         readable.update(token.chars)
@@ -965,16 +1257,18 @@ def _tokenize(
     profanity: str,
     ordered: tuple[tuple[str, tuple[str, ...]], ...],
     elide: bool = True,
+    optional: tuple[int, ...] = (),
 ) -> tuple[_Token, ...]:
     """The positions of one profanity: substitution sets, or literal characters.
-    With ``elide`` the vowel of an elidable word is optional ("fck")."""
+    With ``elide`` the vowel of an elidable word is optional ("fck"), as is the
+    token starting at each character index in ``optional``."""
     elidable = elide and _is_elidable(profanity)
     tokens: list[_Token] = []
     i = 0
     while i < len(profanity):
         for key, options in ordered:
             if profanity.startswith(key, i):
-                tokens.append(_substitution_token(options, elidable and key in _VOWEL_KEYS))
+                tokens.append(_substitution_token(options, (elidable and key in _VOWEL_KEYS) or i in optional))
                 i += len(key)
                 break
         else:
@@ -1484,6 +1778,7 @@ class _RunIndex:
 # Fewest hexadecimal characters that make an identifier (see _is_hex_token).
 _HEX_TOKEN_MINIMUM = 8
 _HEX_CHARACTER = re.compile(r"[0-9a-fA-F]")
+_HEX_RUN = re.compile(r"[0-9a-fA-F-]+")
 
 
 def _root_length(text: str) -> int:
@@ -1529,7 +1824,15 @@ def _is_hex_token(token: str) -> bool:
     )
 
 
-def _is_spanning_word_boundary(matched: str, full_text: str, start: int) -> bool:
+def _is_spanning_word_boundary(
+    matched: str,
+    full_text: str,
+    start: int,
+    compound_parts: Container[str] = frozenset(),
+    window: int = 0,
+    expression: Optional[re.Pattern[str]] = None,
+    reach: int = 0,
+) -> bool:
     if not re.search(r"\s+", matched):
         return False
     parts = re.split(r"\s+", matched)
@@ -1541,6 +1844,22 @@ def _is_spanning_word_boundary(matched: str, full_text: str, start: int) -> bool
     end = start + len(matched)
     embedded_start = start > 0 and bool(re.match(r"\w", full_text[start - 1], re.UNICODE))
     embedded_end = end < len(full_text) and bool(re.match(r"\w", full_text[end], re.UNICODE))
+    # A word glued to another profanity, or to the same one stretched, is a
+    # compound, not a boundary to stop at ("beef curtains|beef curtains",
+    # "fuck|curry muncher", "goo giirl|goo giirl").
+    # Glued on both sides, both neighbours must be profanities: otherwise the
+    # phrase reads across the insides of two words ("doggy|style doggy|style").
+    glued_before = embedded_start and _ends_with_profanity(full_text[max(0, start - window) : start].lower(), compound_parts)
+    glued_after = embedded_end and (
+        _starts_with_profanity(full_text[end : end + window].lower(), compound_parts)
+        or (expression is not None and expression.match(full_text[end : end + reach]))
+    )
+    if embedded_start and embedded_end:
+        if glued_before and glued_after:
+            embedded_start = embedded_end = False
+    else:
+        embedded_start = embedded_start and not glued_before
+        embedded_end = embedded_end and not glued_after
 
     if embedded_start and embedded_end:
         return True
@@ -1566,6 +1885,94 @@ def _is_spanning_word_boundary(matched: str, full_text: str, start: int) -> bool
     return not _has_letter_and_nonletter(parts[:-1])
 
 
+# How many letters of a stretched final run a match gives back to a profanity
+# that follows it.
+_GIVE_BACK_LIMIT = 3
+
+
+def _end_before_profanity(
+    expression: re.Pattern[str],
+    text: str,
+    start: int,
+    end: int,
+    matched: str,
+    compound_parts: Container[str],
+    window: int,
+    reach: int,
+    first: re.Pattern[str],
+    prefixes: Iterable[tuple[str, re.Pattern[str]]] = (),
+    wildcards: Container[str] = frozenset(),
+) -> Optional[tuple[re.Match[str], Optional[re.Match[str]], Optional[tuple[str, re.Pattern[str]]]]]:
+    """The same match ending a few characters earlier, when more than
+    whitespace follows it and what it gave back starts another match of the same
+    expression ("twaatt|waat", "¢yberfuc¢|yberfuc"; ``first`` matches the
+    characters such a match can start with), or, within a final run of one
+    letter, a literal profanity that runs to the end of the word or to an
+    inflection ("shitt|its" -> "shit|tits"; not "gitt|ite", where the double
+    is the word's own). An entry the matched one starts with may take its place
+    when it both fits the shorter text and follows ("5h1t5|h1t" read as
+    "shits" is "shit|shit", "®ape®|ape" is "rape|rape"), as may another
+    expression of the same word ("5cheiss5|cheiss" spelled per letter).
+    Returns the shorter match, the following one (relative to where it
+    starts) when it is one, and the entry and expression taking over (or
+    None), or None.
+
+    A character every letter of the word accepts ("*", in ``wildcards``)
+    spells nothing and is never given back, and a following match is a copy
+    glued to this one, so it holds no whitespace. Following matches are looked for
+    within a few times the match's own length, which a stretched copy of the
+    same word fits in.
+
+    The following match starts inside the run, where the expression's start
+    guard would refuse it, so it is matched on the text from there on, cut to
+    ``reach`` (the longest a match can be)."""
+    if not matched or end >= len(text) or text[end].isspace():
+        return None
+    if text[end - 1].lower() in wildcards:
+        return None
+    reach = min(reach, 4 * len(matched) + 16)
+    # Nothing to give back when the next occurrence already starts where the
+    # match ends ("cordes|cordes").
+    if expression.match(text[end : end + reach]):
+        return None
+    prefixes = [(word, prefix) for word, prefix in prefixes if not prefix.match(text[end : end + reach])]
+    last = matched[-1].lower()
+    run = 1
+    while run < len(matched) and matched[-run - 1].lower() == last:
+        run += 1
+    for given in range(1, min(len(matched) - 1, _GIVE_BACK_LIMIT) + 1):
+        if text[end - given].lower() in wildcards:
+            break
+        follow = expression.match(text[end - given : end - given + reach]) if first.match(text, end - given) else None
+        if follow is not None and _SPACE.search(follow.group(0)):
+            follow = None
+        if follow is not None or (given < run and _ends_word_as_profanity(text, end - given, window, compound_parts)):
+            shorter = expression.fullmatch(matched[:-given])
+            if shorter is not None:
+                return shorter, follow, None
+        for word, prefix in prefixes:
+            shorter = prefix.fullmatch(matched[:-given])
+            if shorter is not None:
+                follow = prefix.match(text[end - given : end - given + reach])
+                if follow is not None and not _SPACE.search(follow.group(0)):
+                    return shorter, follow, (word, prefix)
+    return None
+
+
+def _ends_word_as_profanity(text: str, position: int, window: int, compound_parts: Container[str]) -> bool:
+    """Whether the letters from ``position`` to the end of their word are a
+    profanity, possibly with an inflection ("tits" in "shit|tits"), and not
+    just begin with one ("tit" in "git|tite")."""
+    rest = _PLAIN_HEAD.match(text, position, position + window + _LONGEST_SUFFIX + 1)
+    if rest is None or (rest.end() < len(text) and _ALPHANUMERIC.match(text, rest.end())):
+        return False
+    word = rest.group(0).lower()
+    return any(
+        word[:size] in compound_parts and (size == len(word) or word[size:] in _INFLECTION_SUFFIXES)
+        for size in range(_COMPOUND_PART_MINIMUM, len(word) + 1)
+    )
+
+
 def _joined_word_cut(
     expression: re.Pattern[str],
     matched: str,
@@ -1575,39 +1982,64 @@ def _joined_word_cut(
     words: Container[str],
     longest: int,
     compound_parts: Iterable[str],
+    joined: tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]],
 ) -> Optional[int]:
-    """Where the plain word ends in a match that runs from it through symbols
-    into the first letters of the next word ("hell|-Ll|oyd", "ass|-S|asha"),
-    or None.
+    """Where the plain word ends in a match that runs from it through
+    separators into the first letters of the next word ("hell|-Ll|oyd",
+    "ass|-S|asha", "\\ick|,\\|ick" with a substitute for its first letter),
+    ``_DISCARD`` when the match also starts inside the word before it
+    ("ha|ji-had|ji", "tu|sh-t|ush"): it only joins the ends of two words, or
+    None.
 
-    Symbols inside the obfuscated word itself ("fu-ck|head", "a*s*s|wad",
-    "f-u-c-k|you") are no word boundary, and neither is an inflection after the
-    match ("fu-ck|ing") nor a separator inside one dictionary word, often with
-    its letter repeated around it ("cock*k|blocker", "ra|pis(s|t"). Symbols
-    that stand for letters are no separator either: the profanity must match
-    without them ("lust**g|e" is "lusting", "hell-Ll" still "hellLl"). Nor is
-    the separator a boundary when another profanity continues the word after
-    the match ("ass-hole|fuck"): cutting there would leave that profanity
-    inside an ordinary-looking word, where the substring guard protects it.
+    A separator here is a character no letter stands for. ``joined`` holds the
+    patterns for one, for the last run of them with what follows on the
+    reversed match, and for a word (anything else but whitespace). The word
+    before them has no separator, or is a dictionary word with its own
+    ("shit-brain|-s|hit"). Symbols inside the obfuscated word itself
+    ("fu-ck|head", "a*s*s|wad", "f-u-c-k|you") are no word boundary, and
+    neither is an inflection after the match ("fu-ck|ing") nor a separator
+    inside one dictionary word, often with its letter repeated around it
+    ("cock*k|blocker", "ra|pis(s|t"). Symbols that stand for letters are no
+    separator either: the profanity must match without them ("lust**g|e" is
+    "lusting", "hell-Ll" still "hellLl"). Nor is the separator a boundary when
+    another profanity continues the word after the match ("ass-hole|fuck"):
+    cutting there would leave that profanity inside an ordinary-looking word,
+    where the substring guard protects it.
     """
     if end >= len(text) or not _LETTER.match(text, end):
         return None
-    joined = _JOINED_WORDS.fullmatch(matched)
+    # The letters after the last run of symbols, found on the reversed match
+    # so the search stays linear.
+    separators, joined_tail, word_head = joined
+    backwards = matched[::-1]
+    # Letters or digits after any symbols, from a plain word; or anything
+    # after separators no letter stands for, from a word without them.
+    tail = _JOINED_TAIL.match(backwards)
+    if tail is not None and tail.end() < len(matched) and _PLAIN.fullmatch(matched[: len(matched) - tail.end()]):
+        word_head = _PLAIN_HEAD
+    else:
+        tail = joined_tail.match(backwards)
+        if tail is None or tail.end() == len(matched):
+            return None
+    cut = len(matched) - tail.end()
+    plain, letters = matched[:cut], matched[len(matched) - tail.end(1) :]
     if (
-        joined is None
+        not (not separators.search(plain) or plain.lower() in words)
         or _WORD_HEAD.match(text, end).group(0).lower() in _INFLECTION_SUFFIXES
-        or not expression.fullmatch(joined.group(1) + joined.group(3))
+        or not expression.fullmatch(plain + letters)
     ):
         return None
     # The words on both sides, as far as a dictionary word can reach.
-    before = _PLAIN_TAIL.search(text, max(0, start + joined.end(1) - longest), start + joined.end(1))
-    after = _LETTERS_HEAD.match(text, start + joined.start(3), start + joined.start(3) + longest + 1)
-    left, right = before.group(0).lower(), after.group(0).lower()
-    if left + right in words or (left[-1:] == right[:1] and left + right[1:] in words):
+    before = _PLAIN_TAIL.search(text, max(0, start + cut - longest), start + cut)
+    after = word_head.match(text, end - len(letters), end - len(letters) + longest + 1)
+    left, right = (before.group(0).lower() if before else ""), after.group(0).lower()
+    if left.endswith(plain.lower()) and (left + right in words or (left[-1:] == right[:1] and left + right[1:] in words)):
         return None
-    if _starts_with_profanity(right[len(joined.group(3)) :], compound_parts):
+    if start and _ALPHANUMERIC.match(text, start - 1) and _ALPHANUMERIC.match(matched):
+        return _DISCARD
+    if _starts_with_profanity(right[len(letters) :], compound_parts):
         return None
-    return joined.end(1)
+    return cut
 
 
 def _spelling_characters(tokens: Iterable[_Token]) -> frozenset:
@@ -1635,10 +2067,15 @@ def _retry_before_word_gap(
     text: str,
     start: int,
     matched: str,
+    compound_parts: Container[str] = frozenset(),
+    window: int = 0,
 ) -> Optional[re.Match[str]]:
     """The longest match of ``expression`` at ``start`` that stops before one of
     the gaps between words in ``matched`` and does not span a word boundary
-    itself, or None."""
+    itself, or None. Like every re-match of a candidate's own span it runs on
+    the candidate's text (positions relative to ``start``): the candidate's
+    start already passed the start guard, and one that follows a given-back
+    run (see ``_end_before_profanity``) starts inside that run."""
     # Each maximal run of non-word characters is scanned once; a gap is one
     # that holds whitespace.
     gaps = [gap for gap in _NON_WORD_RUN.finditer(matched) if _SPACE.search(gap.group(0))]
@@ -1647,8 +2084,8 @@ def _retry_before_word_gap(
         # it, last first ("fu**| - k").
         spaces = reversed([gap.start() + space.start() for space in _SPACES.finditer(gap.group(0))])
         for cut in dict.fromkeys([gap.start(), *spaces]):
-            retry = expression.match(text, start, start + cut)
-            if retry is not None and not _is_spanning_word_boundary(retry.group(0), text, start):
+            retry = expression.match(matched[:cut])
+            if retry is not None and not _is_spanning_word_boundary(retry.group(0), text, start, compound_parts, window):
                 return retry
     return None
 
@@ -1659,11 +2096,14 @@ _PHRASE_BREAK = re.compile(r"[,.;:?!]\s|\s[,.;:?!]")
 _NON_WORD_RUN = re.compile(r"\W+")
 _LETTER = re.compile(r"[^\W\d_]")
 _ALPHANUMERIC = re.compile(r"[^\W_]")
-# A plain word (letters and digits), symbols (or "_"), then letters: "hell-Ll",
-# "sh1t-t", "hell_Ll".
-_JOINED_WORDS = re.compile(r"([^\W_]+)((?:[^\w\s]|_)+)([^\W\d_]+)")
+# Returned by _joined_word_cut for a match that only joins two words' ends.
+_DISCARD = -1
 _PLAIN_TAIL = re.compile(r"[^\W_]+\Z")
-_LETTERS_HEAD = re.compile(r"[^\W\d_]+")
+_PLAIN_HEAD = re.compile(r"[^\W_]+")
+# On a reversed match: letters or digits, then symbols (or "_") before them
+# ("hell-Ll", "sh1t-t", "hell]Ll", "5hit-5" read backwards).
+_JOINED_TAIL = re.compile(r"([^\W_]+)((?:[^\w\s]|_)+)")
+_PLAIN = re.compile(r"[^\W_]+")
 _SPACE = re.compile(r"\s")
 _SPACES = re.compile(r"\s+")
 # Inflectional endings (plural, past, participle, comparative, superlative,
@@ -1978,6 +2418,13 @@ def _case_like(source: str, replacement: str) -> str:
         return replacement.capitalize()
     return replacement
 
+
+# How single-language normalization rewrites multi-letter keys in the text
+# (see normalize_with_mapping), for the per-letter variant expressions: German
+# "sch" becomes "sh", so its "c" (at offset 1) is optional ("sh" and "5ch" both
+# match); Spanish "rr" becomes "r" everywhere, so it stays whole (None), while
+# "ll" only becomes "y" at the start of a word and is spelled per letter too.
+_NORMALIZED_KEYS: dict[str, dict[str, Optional[int]]] = {"german": {"sch": 1}, "spanish": {"rr": None}}
 
 _SPANISH_MAP = {
     "á": "a", "Á": "A", "é": "e", "É": "E", "í": "i", "Í": "I", "ó": "o", "Ó": "O",

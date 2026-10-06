@@ -314,6 +314,171 @@ def test_obfuscated_words_running_into_more_letters_keep_their_mask(english, tex
 
 
 @pytest.mark.parametrize(
+    "text, options",
+    [
+        # A stretched final run held the next copy's first letter ("twatt|wat"),
+        # finditer() skipped that copy and the guard protected what was left.
+        pytest.param("twattwat", {}, id="twat-2"),
+        pytest.param("twattwattwat", {}, id="twat-3"),
+        pytest.param("twaattwaat", {}, id="twaat-2"),
+        pytest.param("twaat" * 4, {}, id="twaat-4"),
+        pytest.param("blowjob" * 3, {}, id="blowjob"),
+        pytest.param("kinkkink", {}, id="kink"),
+        pytest.param("raperraper", {}, id="raper"),
+        pytest.param("slutssluts", {}, id="sluts"),
+        pytest.param("dickwaddickwad", {}, id="dickwad"),
+        pytest.param("¢yberfuc¢yberfuc", {}, id="mixed-run"),
+        # A shorter entry took the letters of a pending, supported longer one.
+        pytest.param("baastard" * 3, {}, id="baastard-3"),
+        pytest.param("baastard" * 2, {}, id="baastard-2"),
+        # The entry the match starts with reads the junction ("shit|shit").
+        pytest.param("5h1t5h1t", {}, id="shits-leet"),
+        pytest.param("\u00aeape\u00aeape", {}, id="raper-leet"),
+        pytest.param("k!nkk!nk", {}, id="kinks-leet"),
+        # Through a separator into the next copy.
+        pytest.param("sluut,sluut", {}, id="sluts-comma"),
+        pytest.param("5hit-5hit", {}, id="shits-hyphen"),
+        pytest.param("hadji-hadji", {}, id="jihad-hyphen"),
+        pytest.param("tush-tush", {}, id="shat-hyphen"),
+        pytest.param("skum,skum", {}, id="kums-comma"),
+        pytest.param("fuckfreak-fuckfreak", {}, id="freakfuck-hyphen"),
+        pytest.param("shit-brain-shit-brain", {}, id="hyphenated-entry"),
+        pytest.param("shit-ass,shit-ass", {}, id="hyphenated-entry-comma"),
+        pytest.param("\\ick,\\ick", {}, id="leading-substitute"),
+        # Phrases glued to each other.
+        pytest.param("beef curtainsbeef curtains", {}, id="glued-phrase"),
+        pytest.param("date rape" * 3, {}, id="glued-phrase-3"),
+        pytest.param("goo giirlgoo giirl", {}, id="glued-stretched-phrase"),
+        # An entry containing an earlier, shorter reading of the same letters.
+        pytest.param("fuccckd", {}, id="contains-fucck"),
+        pytest.param("fagggt", {}, id="contains-fagg"),
+        # Multi-letter keys spelled per letter, stretched or in leet.
+        pytest.param("5chwuler", {"languages": "german"}, id="german-leet-sch"),
+        pytest.param("schhm\u00e4hliches", {"languages": "german"}, id="german-stretched-sch"),
+        pytest.param("heuuchlerische", {"languages": "german"}, id="german-stretched-eu"),
+        pytest.param("5cheiss5cheiss", {"languages": "german"}, id="german-leet-repeat"),
+        pytest.param("cerrrdo", {"languages": "spanish"}, id="spanish-rrr"),
+        pytest.param("closclosclos", {"languages": "french"}, id="french-c-for-s"),
+        pytest.param("cordescordes", {"languages": "french"}, id="french-plural-repeat"),
+    ],
+)
+def test_repeated_and_stretched_profanities_are_masked_completely(text, options):
+    # Every character is masked but the separator between two copies, which
+    # is part of neither ("hadji-hadji" -> "*****-*****").
+    junction = SEPARATED_COPIES.get(text)
+    expected = "*" * len(text) if junction is None else junction.join("*" * len(part) for part in text.split(junction, 1))
+    if junction is not None and text.count(junction) > 1:
+        half = (len(text) - 1) // 2
+        expected = "*" * half + junction + "*" * half
+    assert filter_text(text, **options).clean == expected
+
+
+SEPARATED_COPIES = {
+    "sluut,sluut": ",",
+    "5hit-5hit": "-",
+    "hadji-hadji": "-",
+    "tush-tush": "-",
+    "skum,skum": ",",
+    "fuckfreak-fuckfreak": "-",
+    "shit-brain-shit-brain": "-",
+    "shit-ass,shit-ass": ",",
+    "\\ick,\\ick": ",",
+}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cookcook", "vacuumvacuum", "shellshell", "goodgood", "bookkeeper", "hello-world", "assess", "teeth",
+        "succeed", "classroom", "Tisch",
+    ],
+)
+def test_repeated_ordinary_words_stay_clean(english, text):
+    assert english.check(text).clean == text
+
+
+def test_a_containing_match_keeps_the_more_severe_report():
+    # "whooore" reads as "w|hooore" (high) and as "whooore" (moderate): the
+    # more severe reading stays, so minimum_severity="high" still masks it.
+    assert filter_text("whooore").clean == "w******"
+    assert filter_text("whooore", minimum_severity="high").clean == "w******"
+    # A withdrawn match below minimum_severity was never reported.
+    assert filter_text("fuccckd", minimum_severity="extreme").clean == "fuccckd"
+
+
+# --- every bundled entry, repeated ---------------------------------------------------
+
+RARELY_DOUBLED = set("ahijkquvwxy")
+
+
+def _stretched_variants(word, substitutions):
+    # The entry; one interior letter tripled; a rarely doubled letter doubled;
+    # one letter replaced by its first non-letter substitute. (Doubling an
+    # ordinary letter makes a different word by design: "cook", "good".)
+    variants = {"plain": word}
+    interior = [index for index in range(1, len(word) - 1) if word[index].isalpha()]
+    if interior:
+        index = interior[len(interior) // 2]
+        variants["triple"] = word[: index + 1] + word[index] * 2 + word[index + 1 :]
+    rare = [index for index in interior if word[index] in RARELY_DOUBLED]
+    if rare:
+        variants["rare"] = word[: rare[0] + 1] + word[rare[0]] + word[rare[0] + 1 :]
+    for index, character in enumerate(word):
+        options = [option for option in substitutions.get(character, []) if len(option) == 1 and not option.isalpha() and option != "*"]
+        if options:
+            variants["leet"] = word[:index] + options[0] + word[index + 1 :]
+            break
+    return variants
+
+
+# Known failures of the sample below (each copy is checked to be fully masked):
+# a different entry spelled across the junction of two copies, or inside a
+# copy that holds an earlier, more severe reading. The test fails on any other.
+KNOWN_REPEAT_FAILURES = {
+    ("english", "big breasts", "triple"),
+    ("english", "cum licker", "triple"),
+    ("english", "d1ck", "leet"),
+    ("english", "dumb ass", "leet"),
+    ("english", "fugly", "leet"),
+    ("english", "jizzd", "leet"),
+    ("french", "chapons", "rare"),
+    ("french", "clans", "rare"),
+    ("french", "computers", "rare"),
+    ("french", "cornichons", "rare"),
+    ("french", "courriels", "rare"),
+    ("german", "eingeaescherte", "plain"),
+    ("german", "eingeaescherte", "rare"),
+    ("german", "eingeaescherte", "triple"),
+}
+
+
+@pytest.mark.parametrize("language, count", [("english", 60), ("german", 30), ("french", 30), ("spanish", 30)])
+def test_every_entry_repeated_is_masked_completely(language, count):
+    # A seeded sample of the bundled entries (not false positives), each as
+    # itself and stretched, repeated with no separator and with " ", "-", ",":
+    # every character of every copy must be masked. The whole dictionary is
+    # swept the same way outside the test suite.
+    data = json.loads((ROOT / "profy" / "data" / "languages" / f"{language}.json").read_text(encoding="utf-8"))
+    global_data = json.loads((ROOT / "profy" / "data" / "global.json").read_text(encoding="utf-8"))
+    false_positives = {word.lower() for word in global_data["false_positives"] + data.get("false_positives", [])}
+    substitutions = {key.strip("/"): list(options) for key, options in global_data["substitutions"].items()}
+    for key, options in data.get("substitutions", {}).items():
+        substitutions.setdefault(key.strip("/"), []).extend(options)
+    words = sorted({word for word in data["profanities"] if word.lower() not in false_positives})
+    shield = ProfanityFilter(languages=language)
+    failures = set()
+    for word in random.Random(f"profy-{language}").sample(words, count):
+        for kind, variant in _stretched_variants(word, substitutions).items():
+            for separator, times in [("", 1), ("", 2), ("", 3), (" ", 2), ("-", 2), (",", 2)]:
+                text = separator.join([variant] * times)
+                clean = shield.check(text).clean
+                step = len(variant) + len(separator)
+                if any(clean[copy * step : copy * step + len(variant)] != "*" * len(variant) for copy in range(times)):
+                    failures.add((language, word, kind))
+    assert failures <= KNOWN_REPEAT_FAILURES, sorted(failures - KNOWN_REPEAT_FAILURES)
+
+
+@pytest.mark.parametrize(
     "text, clean",
     [
         ("biitchfuck", "**********"),

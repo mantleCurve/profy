@@ -1,5 +1,51 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 9)
+- Invariant sweep ($S/sweep.py): every bundled entry not a false positive,
+  plain / one interior letter tripled / a rarely doubled letter doubled / one
+  leet substitute, repeated 1-4x with "", " ", "-", ",": every character of
+  every copy must be masked. Doubling an ordinary letter makes a different
+  word by design ("cook", "good"); reported separately, not part of the
+  invariant. Failing texts outside that class, r9 -> now: English 5583 ->
+  960, German 7733 -> 373, French 2971 -> 255, Spanish 1357 -> 14.
+- P2 repeated profanities ("twattwat", main too): `_end_before_profanity`
+  gives back up to 3 trailing characters when the same expression, another
+  spelling of the word, or an entry the word starts with matches from there
+  (on a slice: the start guard refuses starts inside the first letter's run),
+  or, inside a run of one letter, a literal profanity runs to the word's end
+  ("shitt|its"; not "gitt|ite"). The following copy goes on a per-candidate
+  stack. Wildcards ("*") are never given back; slices are bounded by 4x the
+  match length. Any other shortened candidate (cross-word retry, joined-word
+  retry) re-tries the expression in the freed letters (`follow_from`).
+- P2 pending chains vs shorter overlaps ("baastard" * 3): a candidate
+  overlapping a longer pending one is deferred until chains are resolved.
+- Same-pass replacement: a candidate strictly containing this pass's accepted
+  matches replaces them when it starts at a word edge and none is more
+  severe (exact block entries always do): "fuccckd", "fagggt", "shhits".
+- Cross-word fixes the sweep exposed: a match that starts inside a word and
+  runs through separators into the next is discarded (`_DISCARD`: "ha|ji-had|
+  ji", "tu|sh-t|ush"); a hyphenated dictionary word before the separator
+  counts as the plain word ("shit-brain|-s"); a stretched word before it is
+  matched against the entries the base starts with ("sluut,s|luut"); the
+  dictionary-word exception needs the left word to cover the plain part; a
+  tail of letters or digits after any symbols, or of substitutes after
+  separators no letter stands for ("\ick|,\|ick"). Glued phrases: a
+  phrase embedded at one end may continue into a profanity or the same
+  expression; at both ends only when both neighbours are profanities.
+- Multi-letter keys: per-letter variant expressions for entries using them,
+  processed before the multi-key expression of the same entry; German "sch"
+  spelled s, optional c, h (normalization turns "sch" into "sh"); Spanish "rr"
+  kept whole; German normalization `s+c+h+` -> "sh", Spanish `r{2,}` -> "r".
+  Per-expression data (first characters, wildcards, elision, takeovers) is
+  computed once (`_ExpressionInfo`).
+- Seeded property test (150 entries, 4 languages) with an explicit list of
+  14 known residual failures, plus regression tests for each class.
+- Differential vs pass 8 (r9), all corpora x 4 languages: native 0 lost,
+  0 smaller masks, 689 gained, 415 masks grown; cross-language 258 lost
+  (spurious short-word fragments across inserted separators inside foreign
+  words), 95 gained. Windowed/compacted vs full scan: 0 diffs. Dictionary
+  scan: 845, identical set and masks.
+
 ## 2026-10-06 (fix/codex-review-hardening, Codex review pass 8)
 - P2 chain alternatives: `_chain_needs` returns every minimal alternative
   (left, right, both) instead of the first; `_resolve_chains` keeps a

@@ -268,7 +268,7 @@ def test_matches_never_share_original_characters():
 
 def _shortener(words, substitutions, floor=3, separators=("-",)):
     ordered = core._ordered_substitutions(substitutions)
-    return core._RunShortener({word: core._tokenize(word, ordered) for word in words}, separators, floor)
+    return core._RunShortener([(word, core._tokenize(word, ordered)) for word in words], separators, floor)
 
 
 def _identity_map(text):
@@ -470,3 +470,18 @@ def test_root_length(text, root):
 )
 def test_repeats_uses_the_root(text, unit, repeats):
     assert core._repeats(text, core._root_length(text), unit) is repeats
+
+
+def test_given_back_letters_need_a_glued_follower():
+    # "xy y" would follow from inside "xx", but a copy holding whitespace is
+    # found by the scan itself; nothing is given back.
+    expression = re.compile(r"xy(?: y)?")
+    found = core._end_before_profanity(expression, "xxy y", 0, 2, "xx", frozenset(), 10, 100, re.compile("x"))
+    assert found is None
+
+
+def test_a_shortened_candidate_is_still_checked_for_hex_tokens():
+    # "12345678 x" runs into "y" and is retried before the space; what is left
+    # is a hex-like identifier, which the hex/UUID guard protects.
+    shield = _with_extra_expressions(ProfanityFilter(block=["zz-hx"]), ("zz-hx", re.compile(r"12345678(?: x)?")))
+    assert _within(30, shield.check, "12345678 xy").is_clean

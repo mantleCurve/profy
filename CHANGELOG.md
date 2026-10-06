@@ -21,6 +21,9 @@
 ### Fixes
 
 - Fixed catastrophic regex backtracking: `check("*" * 22)` took ~29s and `"*" * 24` never finished. Matching is now linear in the input length: 500-character adversarial inputs built from every bundled separator and substitution character finish in well under a second in every language. Very long runs of one character are shortened for matching only (masks still cover the whole run); a letter inside a word matches at most 64 mixed variants (`uüuü...`) or 32 censoring stretches (`f*f*f*...`) in a row.
+- Chains of rarely doubled candidates (`biitchbiitch`, `biitchbiitchfuck`) are caught: neighbouring candidates that only qualify together are resolved together.
+- Explicit block words that form a whole hex-like token (`deadbeef1`, `12345678`) are no longer vetoed by the hex/UUID guard.
+- The confirming pass only rescans regions the previous pass's masks can affect (exactly equivalent to a full rescan): a 100k-character text with a few matches is checked about twice as fast, and dense text about 20% faster.
 - Match-dense text was quadratic (`"shit " * 512000` took ~80s with a one-word filter, now ~4s): accepted matches are masked once per pass instead of copying the text and shifting index lists per match.
 - A block word now always matches its own text: `full-length`, `cross-site` and `niggardliness's` did not match because a run of repeated letters swallowed the separator the word spells later; entries with internal whitespace and, with `driver="pattern"`, entries that start or end with a symbol (`c++`, `100%`) did not match either; and an equally long bundled entry could claim part of it first.
 - `hell, Lloyd` and `Hell, llama` were left unmasked: a match that runs across a phrase break into the next word is now retried before the break.

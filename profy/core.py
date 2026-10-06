@@ -177,10 +177,16 @@ class ProfanityFilter:
         working_map = normalized_map
         keep_scanning = True
 
+        # Each expression's matches in the previous pass, and the spans that pass
+        # masked: a confirming pass only rescans where those masks can matter.
+        previous: dict[int, list[tuple[int, int, str]]] = {}
+        changed: list[tuple[int, int]] = []
+
         # ``working`` is already whitespace-collapsed and masking never adds
         # whitespace, so (unlike Blasp) it is not re-collapsed on every pass.
         while keep_scanning:
             keep_scanning = False
+            finder = _CandidateFinder(working, changed, dictionary.stops)
             # Every context lookup is a bisect into runs computed once per pass,
             # and accepted spans are masked (with \x01) once at the end of the
             # pass, so each candidate costs time independent of the text length.
@@ -191,21 +197,57 @@ class ProfanityFilter:
             hex_verdicts: dict[tuple[int, int], bool] = {}
             taken = bytearray(len(working))
             accepted: list[tuple[int, int]] = []
+            pending: list[tuple[int, int, str, bool, bool]] = []
 
-            for base, expression in expressions:
-                for found in list(expression.finditer(working)):
-                    start, end = found.span()
-                    matched_text = found.group(0)
+            def masked(index: int) -> bool:
+                return 0 <= index < len(working) and (working[index] == "\x01" or bool(taken[index]))
+
+            def is_false_positive(start: int, end: int) -> bool:
+                word_start, word_end = words.around(start, end)
+                return (
+                    word_end - word_start <= dictionary.longest_false_positive
+                    and working[word_start:word_end].lower() in dictionary.false_positives
+                )
+
+            def accept(start: int, end: int, base: str) -> None:
+                taken[start:end] = b"\x01" * (end - start)
+                accepted.append((start, end))
+
+                severity = dictionary.severity_for(base)
+                if self.minimum_severity is not None and not severity.is_at_least(self.minimum_severity):
+                    return
+                original_start, original_end = _original_span(working_map, start, end)
+                if claimed.find(1, original_start, original_end) != -1:
+                    return
+                claimed[original_start:original_end] = b"\x01" * (original_end - original_start)
+                matches.append(
+                    Match(
+                        text=original[original_start:original_end],
+                        base=base,
+                        severity=severity,
+                        position=original_start,
+                        length=original_end - original_start,
+                        language=",".join(self.languages),
+                    )
+                )
+
+            for number, (base, expression) in enumerate(expressions):
+                if finder.mode == "full":
+                    candidates = [(found.start(), found.end(), found.group(0)) for found in expression.finditer(working)]
+                else:
+                    candidates = finder.candidates(expression, previous.get(number))
+                previous[number] = candidates
+                for start, end, matched_text in candidates:
 
                     if _is_spanning_word_boundary(matched_text, working, start):
                         # Rejected for running across a phrase break ("hell, Ll|oyd");
                         # the same profanity may still match before the break.
                         cut = _PHRASE_BREAK.search(matched_text)
-                        found = expression.match(working, start, start + cut.start()) if cut else None
-                        if found is None or _is_spanning_word_boundary(found.group(0), working, start):
+                        retry = expression.match(working, start, start + cut.start()) if cut else None
+                        if retry is None or _is_spanning_word_boundary(retry.group(0), working, start):
                             continue
-                        end = found.end()
-                        matched_text = found.group(0)
+                        end = retry.end()
+                        matched_text = retry.group(0)
 
                     # A zero-length match can never be masked and would keep the
                     # scan loop alive forever, so it is never accepted. Masked
@@ -215,7 +257,11 @@ class ProfanityFilter:
                     token = hex_runs.around(start, end)
                     if token not in hex_verdicts:
                         hex_verdicts[token] = _is_hex_token(working[token[0] : token[1]])
-                    if hex_verdicts[token]:
+                    # An explicit block word that is the whole token is masked
+                    # anyway ("deadbeef1", "12345678").
+                    if hex_verdicts[token] and not (
+                        base in dictionary.blocked and working[token[0] : token[1]].strip("-") == matched_text
+                    ):
                         continue
 
                     # For the Scunthorpe-style substring guard we use the
@@ -224,54 +270,35 @@ class ProfanityFilter:
                     # protection that keeps a real word like "hello" from being
                     # masked just because it contains the profanity "hell".
                     word_start, word_end = letters.around(start, end)
-                    # Directly touching an accepted match also makes a compound
-                    # ("biitch|fuck", where "biitch" is no literal entry).
-                    touches_before = start > 0 and (working[start - 1] == "\x01" or bool(taken[start - 1]))
-                    touches_after = end < len(working) and (working[end] == "\x01" or bool(taken[end]))
-                    if _is_pure_alpha_substring(
+                    guard = (
                         matched_text,
                         immutable_normalized[max(word_start, start - window) : start],
                         immutable_normalized[end : min(word_end, end + window)],
                         base,
                         dictionary.compound_parts,
-                        touches_before=touches_before,
-                        touches_after=touches_after,
-                    ):
-                        continue
-                    word_start, word_end = words.around(start, end)
-                    if (
-                        word_end - word_start <= dictionary.longest_false_positive
-                        and working[word_start:word_end].lower() in dictionary.false_positives
-                    ):
-                        continue
-
-                    keep_scanning = True
-                    taken[start:end] = b"\x01" * (end - start)
-                    accepted.append((start, end))
-
-                    severity = self.dictionary.severity_for(base)
-                    if (
-                        self.minimum_severity is not None
-                        and not severity.is_at_least(self.minimum_severity)
-                    ):
-                        continue
-
-                    original_start, original_end = _original_span(working_map, start, end)
-                    if claimed.find(1, original_start, original_end) != -1:
-                        continue
-                    claimed[original_start:original_end] = b"\x01" * (original_end - original_start)
-                    matches.append(
-                        Match(
-                            text=original[original_start:original_end],
-                            base=base,
-                            severity=severity,
-                            position=original_start,
-                            length=original_end - original_start,
-                            language=",".join(self.languages),
-                        )
                     )
+                    # Directly touching an accepted match also makes a compound
+                    # ("biitch|fuck", where "biitch" is no literal entry).
+                    touches_before = masked(start - 1)
+                    touches_after = masked(end)
+                    if _is_pure_alpha_substring(*guard, touches_before=touches_before, touches_after=touches_after):
+                        # It may still be one link of a chain of candidates that
+                        # only qualify together ("biitch|biitch"); see below.
+                        need = _chain_need(guard, touches_before, touches_after)
+                        if need is not None and not is_false_positive(start, end):
+                            pending.append((start, end, base, need[0], need[1]))
+                    elif not is_false_positive(start, end):
+                        keep_scanning = True
+                        accept(start, end, base)
+
+            # Accept the chains of protected candidates whose missing neighbours
+            # are each other ("biitch|biitch", "biitch|biitch|fuck").
+            for start, end, base in _resolve_chains(pending, masked):
+                keep_scanning = True
+                accept(start, end, base)
 
             working = _mask_spans(working, accepted)
+            changed = sorted(accepted)
 
         return ShieldResult(original, self._apply_masks(original, matches), tuple(matches), _score(matches, text))
 
@@ -402,13 +429,19 @@ class _Dictionary:
         self.context_window = max([len(part) for part in self.compound_parts] + [_LONGEST_SUFFIX + 1])
         self.longest_false_positive = max([0] + [len(word) for word in self.false_positives])
         self.long_run_pattern = rf"(.)\1{{{self.longest_run},}}"
+        # Stop classes of the generated expressions (see _compile_profanity),
+        # keyed by id(): hashing a compiled pattern re-hashes its whole program.
+        # The expressions live as long as this dictionary, so ids stay unique.
+        self.stops: dict[int, re.Pattern[str]] = {}
         if driver == "pattern":
             self.expressions = _generate_literal_expressions(profanities)
         else:
-            self.expressions = _generate_expressions(profanities, separators, substitutions)
+            self.expressions, stops = _generate_reaching_expressions(profanities, separators, substitutions)
+            self.stops = {id(expression): stop for expression, stop in stops.items()}
         # Longest first; among equally long words an explicitly blocked one goes
         # first, so it always matches its own text ("*6zy" before "fagz").
         blocked = frozenset(blocked)
+        self.blocked = blocked
         self.sorted_expressions = tuple(
             sorted(self.expressions.items(), key=lambda item: (len(item[0]), item[0] in blocked), reverse=True)
         )
@@ -583,16 +616,27 @@ def _generate_expressions(
     separators: list[str],
     substitutions: Mapping[str, list[str]],
 ) -> dict[str, re.Pattern[str]]:
+    return _generate_reaching_expressions(profanities, separators, substitutions)[0]
+
+
+def _generate_reaching_expressions(
+    profanities: list[str],
+    separators: list[str],
+    substitutions: Mapping[str, list[str]],
+) -> tuple[dict[str, re.Pattern[str]], dict[re.Pattern[str], re.Pattern[str]]]:
+    """The expressions, and for each one the class of characters it never
+    reads past (see ``_compile_profanity``)."""
     options_by_key = {
         character.strip("/"): tuple(options)
         for character, options in substitutions.items()
         if character.strip("/")
     }
     ordered = tuple(sorted(options_by_key.items(), key=lambda item: len(item[0]), reverse=True))
-    return {
-        profanity: _compile_profanity(profanity, ordered, tuple(separators))
-        for profanity in profanities
-    }
+    compiled = {profanity: _compile_profanity(profanity, ordered, tuple(separators)) for profanity in profanities}
+    return (
+        {profanity: pair[0] for profanity, pair in compiled.items()},
+        {pair[0]: pair[1] for pair in compiled.values()},
+    )
 
 
 # Compiled expressions are shared between dictionaries, so a filter that only
@@ -602,7 +646,18 @@ def _compile_profanity(
     profanity: str,
     ordered: tuple[tuple[str, tuple[str, ...]], ...],
     separators: tuple[str, ...],
-) -> re.Pattern[str]:
+) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """The expression for one profanity and its *stop* class.
+
+    The stop class matches every character that no part of the expression can
+    consume or test positively: all token classes, multi-character options and
+    literals, every separator and whitespace are excluded from it. Each
+    construct reads forward only through characters it accepts, and the only
+    look-behind (the start guard) reads one character before the match, so an
+    attempt starting at ``p`` reads nothing outside ``[p - 1, s]``, where ``s``
+    is the first stop character at or after ``p``. The confirming passes rely
+    on this to rescan only where masking changed the text.
+    """
     lowered = profanity.lower()
     vowel_positions = [index for index, character in enumerate(lowered) if character in _VOWEL_KEYS]
     consonant_letters = sum(
@@ -624,7 +679,14 @@ def _compile_profanity(
         else:
             tokens.append(_Token(frozenset(), (), literal=profanity[i]))
             i += 1
-    return re.compile(_tokens_expression(tokens, separators), re.IGNORECASE | re.UNICODE)
+    readable: set[str] = set(separators)
+    for token in tokens:
+        readable.update(token.chars)
+        readable.update(character for option in token.multi for character in option)
+        if token.literal is not None:
+            readable.add(token.literal)
+    stop = re.compile(r"[^\s" + "".join(_class_members(readable)) + "]", re.IGNORECASE | re.UNICODE)
+    return re.compile(_tokens_expression(tokens, separators), re.IGNORECASE | re.UNICODE), stop
 
 
 def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
@@ -859,6 +921,221 @@ def _compile_literal(profanity: str) -> re.Pattern[str]:
         r"(?<!\w)" + r"\s+".join(re.escape(part) for part in profanity.lower().split(" ")) + r"(?!\w)",
         re.IGNORECASE | re.UNICODE,
     )
+
+
+def _chain_need(guard: tuple, touches_before: bool, touches_after: bool) -> Optional[tuple[bool, bool]]:
+    """Which side(s) of a protected candidate would have to touch another match
+    for the candidate to count as part of a compound; None if that is not
+    enough to lift the protection."""
+    for need_before, need_after in ((True, False), (False, True), (True, True)):
+        if not _is_pure_alpha_substring(
+            *guard,
+            touches_before=touches_before or need_before,
+            touches_after=touches_after or need_after,
+        ):
+            return need_before and not touches_before, need_after and not touches_after
+    return None
+
+
+def _resolve_chains(
+    pending: list[tuple[int, int, str, bool, bool]],
+    masked: Callable[[int], bool],
+) -> list[tuple[int, int, str]]:
+    """The greatest set of pending candidates whose needed sides each touch a
+    match or another candidate of the set, without overlaps.
+
+    Linear-time support counting: a candidate whose needed neighbour count
+    drops to zero is removed and its neighbours lose its support in turn.
+    """
+    alive = [not any(masked(index) for index in range(start, end)) for start, end, _, _, _ in pending]
+
+    def settle() -> None:
+        ending: dict[int, list[int]] = {}
+        starting: dict[int, list[int]] = {}
+        for index, (start, end, _, _, _) in enumerate(pending):
+            if alive[index]:
+                ending.setdefault(end, []).append(index)
+                starting.setdefault(start, []).append(index)
+        support = []
+        for index, (start, end, _, need_before, need_after) in enumerate(pending):
+            before = len(ending.get(start, ())) if need_before and not masked(start - 1) else -1
+            after = len(starting.get(end, ())) if need_after and not masked(end) else -1
+            support.append([before, after])
+        queue = [index for index in range(len(pending)) if alive[index] and 0 in support[index]]
+        while queue:
+            index = queue.pop()
+            if not alive[index]:
+                continue
+            alive[index] = False
+            start, end = pending[index][0], pending[index][1]
+            for neighbour in ending.get(start, ()):
+                if alive[neighbour] and support[neighbour][1] > 0:
+                    support[neighbour][1] -= 1
+                    if support[neighbour][1] == 0:
+                        queue.append(neighbour)
+            for neighbour in starting.get(end, ()):
+                if alive[neighbour] and support[neighbour][0] > 0:
+                    support[neighbour][0] -= 1
+                    if support[neighbour][0] == 0:
+                        queue.append(neighbour)
+
+    settle()
+    # Overlapping survivors (different words over the same letters): keep the
+    # first (longer words come first), then settle the supports again.
+    claimed: set[int] = set()
+    for index, (start, end, _, _, _) in enumerate(pending):
+        if alive[index]:
+            if claimed.intersection(range(start, end)):
+                alive[index] = False
+            else:
+                claimed.update(range(start, end))
+    settle()
+    return [(start, end, base) for index, (start, end, base, _, _) in enumerate(pending) if alive[index]]
+
+
+# The windowed rescan does a few searches per masked span and expression; past
+# about one masked span per this many characters a scan of the compacted text
+# is cheaper. Either way the result is the same.
+_WINDOW_SPACING = 256
+_SHORTCUT_MINIMUM = 512
+
+
+class _CandidateFinder:
+    """``expression.finditer(text)`` for every expression of one pass, as
+    (start, end, text) tuples, computed cheaply on confirming passes.
+
+    A confirming pass sees the previous pass's text with ``changed`` spans
+    replaced by \x01, which no generated expression reads past (it is in every
+    stop class). Two exact shortcuts follow:
+
+    * Windowed rescan: an attempt starting at ``p`` reads only ``[p - 1, s]``
+      (``s`` = first stop character at or after ``p``), so only attempts in a
+      *zone* -- from the start of the readable run before a changed span up to
+      its end -- can differ from the previous pass. Outside the zones the
+      previous pass's matches are reused, and real searches are bounded by
+      ``endpos`` just past the stop character ending the zone, which no
+      attempt in the zone reads beyond.
+    * Compaction: runs of \x01 are collapsed to one character (an attempt
+      reads at most the first of them, and the look-behind at most the last),
+      the compacted text is scanned, and positions are mapped back.
+
+    Expressions without a known stop class (anything not generated here) are
+    always scanned in full.
+    """
+
+    def __init__(self, text: str, changed: list[tuple[int, int]], stops: Mapping[int, re.Pattern[str]]):
+        self.text = text
+        self.stops = stops
+        self.blocks: list[list[int]] = []
+        for start, end in changed:
+            if self.blocks and start <= self.blocks[-1][1]:
+                self.blocks[-1][1] = max(self.blocks[-1][1], end)
+            else:
+                self.blocks.append([start, end])
+        self.reversed = ""
+        self.compact: Optional[tuple[str, list[int]]] = None
+        # Chosen once per pass; every strategy gives the same result. On short
+        # texts a plain scan is cheaper than either shortcut.
+        if not self.blocks or len(text) < _SHORTCUT_MINIMUM:
+            self.mode = "full"
+        elif len(self.blocks) * _WINDOW_SPACING <= len(text):
+            self.mode = "windowed"
+            self.reversed = text[::-1]
+        else:
+            self.mode = "compacted"
+
+    def candidates(
+        self,
+        expression: re.Pattern[str],
+        previous: Optional[list[tuple[int, int, str]]],
+    ) -> list[tuple[int, int, str]]:
+        if previous is None:
+            return self._full(expression)
+        stop = self.stops.get(id(expression))
+        if stop is None:
+            return self._full(expression)
+        if self.mode == "windowed":
+            return self._windowed(expression, stop, previous)
+        return self._compacted(expression)
+
+    def _full(self, expression: re.Pattern[str]) -> list[tuple[int, int, str]]:
+        return [(found.start(), found.end(), found.group(0)) for found in expression.finditer(self.text)]
+
+    def _compacted(self, expression: re.Pattern[str]) -> list[tuple[int, int, str]]:
+        if self.compact is None:
+            pieces: list[str] = []
+            origin: list[int] = []
+            cursor = 0
+            for run in re.finditer("\x01{2,}", self.text):
+                pieces.append(self.text[cursor : run.start() + 1])
+                origin.extend(range(cursor, run.start() + 1))
+                cursor = run.end()
+            pieces.append(self.text[cursor:])
+            origin.extend(range(cursor, len(self.text) + 1))
+            self.compact = ("".join(pieces), origin)
+        text, origin = self.compact
+        # Matches never contain \x01, so both ends map back directly.
+        return [
+            (origin[found.start()], origin[found.end() - 1] + 1, found.group(0)) for found in expression.finditer(text)
+        ]
+
+    def _windowed(
+        self,
+        expression: re.Pattern[str],
+        stop: re.Pattern[str],
+        previous: list[tuple[int, int, str]],
+    ) -> list[tuple[int, int, str]]:
+        text = self.text
+        size = len(text)
+        zones: list[list[int]] = []
+        for start, end in self.blocks:
+            # Attempts reaching the span start inside the readable run before it.
+            before = stop.search(self.reversed, size - start) if start else None
+            first = size - before.start() if before else 0
+            if zones and first <= zones[-1][1] + 1:
+                zones[-1][1] = end
+            else:
+                zones.append([first, end])
+
+        found: list[tuple[int, int, str]] = []
+        position = 0
+        index = 0
+        zone = 0
+        while position <= size:
+            while index < len(previous) and previous[index][0] < position:
+                index += 1
+            while zone < len(zones) and zones[zone][1] < position:
+                zone += 1
+            next_zone = zones[zone][0] if zone < len(zones) else size + 1
+            if index == 0 or previous[index - 1][1] <= position:
+                # In step with the previous pass: its next match stands unless
+                # a zone comes first.
+                if index < len(previous) and previous[index][0] < next_zone:
+                    if previous[index][0] == previous[index][1]:
+                        # Empty matches advance differently; generated
+                        # expressions never produce them.
+                        return self._full(expression)
+                    found.append(previous[index])
+                    position = previous[index][1]
+                    continue
+                if zone == len(zones):
+                    break
+                low, high = max(position, zones[zone][0]), zones[zone][1]
+            else:
+                # Resuming inside a match of the previous pass: its later
+                # starts were never tried there.
+                low, high = position, previous[index - 1][1] - 1
+            ending = stop.search(text, high)
+            limit = min(size, (ending.start() if ending else size) + 1)
+            position = high + 1
+            for match in expression.finditer(text, low, limit):
+                if match.start() > high:
+                    break
+                if match.end() == match.start():
+                    return self._full(expression)
+                found.append((match.start(), match.end(), match.group(0)))
+                position = max(position, match.end())
+        return found
 
 
 def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:

@@ -1,5 +1,24 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening, Codex review pass 4)
+- P2 rare-double chains: protected candidates that would qualify with a
+  profane neighbour are kept pending (`_chain_need`) and resolved per pass by
+  a linear support-counting fixpoint (`_resolve_chains`); accepted via a shared
+  `accept()` closure.
+- P2 block words vs hex guard: a blocked entry that is the whole hex token is
+  exempt. Property test gains hex-like/all-digit/digit+letter shapes.
+- Confirming-pass windowing (`_CandidateFinder`): each generated expression
+  gets a stop class (`_compile_profanity`); an attempt at p reads only
+  [p - 1, first stop char]. Confirming passes reuse the previous pass's
+  matches outside zones around masked spans and search zones with an exact
+  endpos bound, or scan a compacted copy (\x01 runs collapsed) when masks are
+  dense; short texts (< 512 chars) and unknown expressions scan in full.
+  Equivalence vs the pre-windowing engine: 0 diffs over ~66k texts per
+  strategy (windowed, compacted, default) in all 4 languages. Stops are keyed
+  by id() (Pattern.__hash__ re-hashes the compiled program: 1.8us per lookup).
+- Timing (default filter): "shit "*32000 8.09s -> 6.63s; 100k clean text with
+  5 matches 0.99s -> 0.50s; README prose 10k/100k and clean 100k unchanged.
+
 ## 2026-10-06 (fix/codex-review-hardening, Codex review pass 3)
 - P1 per-match mutation: masks are applied once per pass (`_mask_spans`),
   same-pass claims use a bytearray, original-coordinate claims a bytearray,

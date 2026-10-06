@@ -230,6 +230,27 @@ def test_rare_doubles_inside_compounds(english, text, clean):
 @pytest.mark.parametrize(
     "text, clean",
     [
+        # Neighbours that only qualify together are resolved as a chain.
+        ("biitchbiitch", "************"),
+        ("biitchbiitchfuck", "****************"),
+        ("shiitbiitch", "***********"),
+        ("fuckbiitchbiitch", "****************"),
+        ("biitch" * 40, "*" * 240),
+        # A chain that does not reach a word edge stays protected.
+        ("xbiitchbiitch", "xbiitchbiitch"),
+        ("biitchbiitchx", "biitchbiitchx"),
+        ("x" + "biitch" * 40, "x" + "biitch" * 40),
+        ("vacuumvacuum", "vacuumvacuum"),
+        ("cookcook", "cookcook"),
+    ],
+)
+def test_chains_of_rare_double_candidates(english, text, clean):
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
         ("shitxshithell", "shitx********"),
         ("hellxhellshit", "hellx********"),
         ("shitshit", "********"),

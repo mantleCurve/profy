@@ -251,6 +251,9 @@ BLOCK_WORDS = [
     "llama", "ssss-ssss", "M\u00e4dchen", "na\u00efve", "fa\u00e7ade", "\u0395\u03bb\u03bb\u03ac\u03b4\u03b1",
     "\u65e5\u672c", "\U0001F600", "a\U0001F600b", "MiXeD", "UPPER", "\u0141\u00d3D\u0179", "stra\u00dfe",
     "x", "ab", "a b", "a-", "-a", "...", "--", "_under_", "tab\tbed", "*6zy",
+    # Hex-like, all-digit and digit+letter shapes the hex guard would protect.
+    "deadbeef1", "12345678", "1234567890abcdef", "a1b2c3d4e5", "0xdeadbeef", "cafe-babe-1234",
+    "123e4567-e89b-12d3-a456-42661417b00b", "00000000", "9" * 40,
 ]
 
 
@@ -270,6 +273,12 @@ def test_a_block_word_always_masks_its_own_text(driver):
         expected = lead + "*" * len(core) + word[len(lead) + len(core) :]
         assert result.original == word
         assert result.clean == expected, (driver, word, result.clean)
+
+
+def test_block_words_inside_longer_hex_tokens_stay_protected():
+    # Only a block word that is the whole token is exempt from the hex guard.
+    assert filter_text("id ab12cd34ef", block=["ab"]).clean == "id ab12cd34ef"
+    assert filter_text("id deadbeef1 ok", block=["deadbeef1"]).clean == "id ********* ok"
 
 
 def test_block_entries_collapse_whitespace():

@@ -278,3 +278,92 @@ def test_phrase_break_retry_is_still_guarded():
     shield = _with_extra_expressions(ProfanityFilter(block=["zz-retry"]), ("zz-ab", re.compile("ab cd, ef|ab cd")))
     result = _within(30, shield.check, "xab cd, efx")
     assert result.is_clean
+
+
+def test_resolve_chains():
+    masked = lambda index: index in {20}  # noqa: E731
+    pending = [
+        (0, 3, "a", False, True),  # needs the right neighbour (3, 6)
+        (3, 6, "b", True, False),  # needs the left neighbour (0, 3)
+        (10, 13, "c", True, False),  # needs a left neighbour, has none
+        (13, 16, "d", True, False),  # leans on (10, 13), which falls
+        (17, 20, "e", False, True),  # touches a masked character
+        (3, 5, "f", True, False),  # overlaps (3, 6), which came first
+    ]
+    assert core._resolve_chains(pending, masked) == [(0, 3, "a"), (3, 6, "b"), (17, 20, "e")]
+    assert core._resolve_chains([(0, 3, "a", True, False)], lambda index: index in {0, 1}) == []
+
+
+def test_resolve_chains_support_counting():
+    never = lambda index: False  # noqa: E731
+    pending = [
+        (0, 3, "l", False, True),  # two right neighbours; one falls, one stays
+        (3, 6, "m", True, False),
+        (3, 5, "n", True, True),  # nothing starts at 5
+        (7, 10, "a", False, False),
+        (8, 10, "b", True, False),  # nothing ends at 8
+        (10, 13, "r", True, False),  # two left neighbours; one falls, one stays
+        (20, 23, "d", True, True),  # no left neighbour, and its right one falls too
+        (23, 26, "f", False, True),
+    ]
+    assert core._resolve_chains(pending, never) == [(0, 3, "l"), (3, 6, "m"), (7, 10, "a"), (10, 13, "r")]
+
+
+STRATEGY_TEXTS = [
+    "shit " * 300,
+    "fuck shit damn hell " * 50,
+    "a long and perfectly clean sentence about cooking " * 20 + "shit",
+    "shit, said the bitches " * 30,
+    "biitchbiitch fuuck shiit cook " * 25,
+    "f u c k s h i t " * 40,
+    "deadbeef1234 fuck " * 30,
+    "\u200bf\u200bu\u200bc\u200bk " * 20,
+    "sh!t f*ck @ss a$$ " * 40,
+    "hell, Lloyd and ass, sam " * 30,
+    "coo-on koo oon pimm-mel " * 30,
+    "fuckfuckfuck shitshit " * 30,
+]
+
+
+def _result_key(result):
+    return result.clean, [(match.base, match.position, match.length) for match in result.matches]
+
+
+@pytest.mark.parametrize("languages", ["english", "german"])
+def test_confirming_pass_strategies_are_equivalent(monkeypatch, languages):
+    full = ProfanityFilter(languages=languages)
+    expected = []
+    dictionary = copy.copy(full.dictionary)
+    dictionary.stops = {}  # every pass scans the whole text
+    full.dictionary = dictionary
+    expected = [_result_key(full.check(text)) for text in STRATEGY_TEXTS]
+    shield = ProfanityFilter(languages=languages)
+    monkeypatch.setattr(core, "_SHORTCUT_MINIMUM", 0)
+    for spacing in (0, 10**12, core._WINDOW_SPACING):
+        monkeypatch.setattr(core, "_WINDOW_SPACING", spacing)
+        assert [_result_key(shield.check(text)) for text in STRATEGY_TEXTS] == expected, spacing
+
+
+def test_windowed_rescan_falls_back_for_empty_matches(monkeypatch):
+    # Generated expressions never match empty; anything that does is scanned
+    # in full rather than windowed, both for reused and for new matches.
+    monkeypatch.setattr(core, "_WINDOW_SPACING", 0)
+    monkeypatch.setattr(core, "_SHORTCUT_MINIMUM", 0)
+    loose = re.compile("x*")
+    text = "ab\x01\x01xx"
+    expected = [(match.start(), match.end(), match.group(0)) for match in loose.finditer(text)]
+    finder = core._CandidateFinder(text, [(2, 4)], {id(loose): re.compile("[^x]")})
+    assert finder.candidates(loose, [(0, 0, "")]) == expected
+    assert finder.candidates(loose, []) == expected
+
+
+def test_short_texts_and_unknown_expressions_are_scanned_in_full():
+    finder = core._CandidateFinder("shit", [(0, 4)], {})
+    assert finder.mode == "full"
+    loose = re.compile("x")
+    long_text = "x" * 600
+    finder = core._CandidateFinder(long_text, [(0, 1)], {})
+    assert finder.mode == "windowed"
+    assert finder.candidates(loose, None) == finder.candidates(loose, []) == [
+        (index, index + 1, "x") for index in range(600)
+    ]

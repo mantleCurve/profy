@@ -425,3 +425,22 @@ def test_short_texts_and_unknown_expressions_are_scanned_in_full():
     assert finder.candidates(loose, None) == finder.candidates(loose, []) == [
         (index, index + 1, "x") for index in range(600)
     ]
+
+
+@pytest.mark.parametrize(
+    "text, root",
+    [("", 0), ("a", 1), ("aaaa", 1), ("1212", 2), ("121212", 2), ("12121", 5), ("abcab", 5), ("aabaab", 3), ("abab8", 5)],
+)
+def test_root_length(text, root):
+    assert core._root_length(text) == root
+
+
+@pytest.mark.parametrize(
+    "text, unit, repeats",
+    [
+        ("12121212", "12", True), ("12121212", "1212", True), ("12121212", "121", False), ("12121212", "21", False),
+        ("12121212", "12121212", True), ("deadbeef1", "DeadBeef1", True), ("abab8", "ab", False), ("aaaa", "", False),
+    ],
+)
+def test_repeats_uses_the_root(text, unit, repeats):
+    assert core._repeats(text, core._root_length(text), unit) is repeats

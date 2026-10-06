@@ -257,6 +257,30 @@ def test_separator_joined_words_stay_apart(english, text, clean):
     assert english.check(text).clean == clean
 
 
+SEVERITY_LEVELS = [None, "mild", "moderate", "high", "extreme"]
+
+
+@pytest.mark.parametrize(
+    "text, cleans",
+    [
+        # A separator-obfuscated word continued by another profanity is one
+        # compound; cutting it at the separator ("***-holefuck") left the second
+        # profanity protected inside "holefuck", unreported at "high".
+        ("ass-holefuck", ["*" * 12] * 3 + ["ass-hole****", "ass-holefuck"]),
+        ("ass-holebitch", ["*" * 13] * 3 + ["ass-holebitch"] * 2),
+        ("sh-itfuck", ["*" * 9] * 4 + ["sh-itfuck"]),
+        ("fu-ckshit", ["*" * 9] * 4 + ["fu-ckshit"]),
+        ("cock-suckerass", ["*" * 14] * 3 + ["***********ass", "cock-suckerass"]),
+        # Words joined to an ordinary word stay apart at every level.
+        ("hell-Lloyd", ["****-Lloyd"] * 2 + ["hell-Lloyd"] * 3),
+        ("shit-tom", ["****-tom"] * 4 + ["shit-tom"]),
+        ("ass-Sasha", ["***-Sasha"] * 3 + ["ass-Sasha"] * 2),
+    ],
+)
+def test_joined_words_at_every_minimum_severity(text, cleans):
+    assert [filter_text(text, minimum_severity=level).clean for level in SEVERITY_LEVELS] == cleans
+
+
 @pytest.mark.parametrize(
     "text",
     [

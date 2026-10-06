@@ -193,7 +193,9 @@ class ProfanityFilter:
             words = _RunIndex(working, r"\w+")
             hex_runs = _RunIndex(working, r"[0-9a-fA-F-]+")
             hex_verdicts: dict[tuple[int, int], bool] = {}
-            whole_block_tokens: dict[tuple[int, int, str], bool] = {}
+            # Hex tokens a block word may fill: their case-folded text and the
+            # length of their shortest repeated unit, computed once per token.
+            token_roots: dict[tuple[int, int], tuple[str, int]] = {}
             taken = bytearray(len(working))
             accepted: list[tuple[int, int]] = []
             pending: list[tuple[int, int, str, bool, bool]] = []
@@ -209,12 +211,13 @@ class ProfanityFilter:
                 )
 
             def is_whole_block_token(token: tuple[int, int], matched_text: str) -> bool:
-                # Each token is compared once per distinct match text and pass:
-                # "12" * n with block=["12"] has n matches in one token.
-                key = (token[0], token[1], matched_text.lower())
-                if key not in whole_block_tokens:
-                    whole_block_tokens[key] = _repeats(working[token[0] : token[1]].strip("-"), matched_text)
-                return whole_block_tokens[key]
+                # One token can hold many (distinct) matches: "12" * n with
+                # block=["12"], or "ab"/"8" variants in "ab8b8..."; each costs
+                # its own length, not the token's.
+                if token not in token_roots:
+                    folded = working[token[0] : token[1]].strip("-").lower()
+                    token_roots[token] = (folded, _root_length(folded))
+                return _repeats(*token_roots[token], matched_text)
 
             def accept(start: int, end: int, base: str) -> None:
                 taken[start:end] = b"\x01" * (end - start)
@@ -266,7 +269,14 @@ class ProfanityFilter:
                         # word before them ("shit-t|om" read as "shitt"), that
                         # entry gets it.
                         cut = _joined_word_cut(
-                            expression, matched_text, working, start, end, dictionary.words, dictionary.longest_word
+                            expression,
+                            matched_text,
+                            working,
+                            start,
+                            end,
+                            dictionary.words,
+                            dictionary.longest_word,
+                            dictionary.compound_parts,
                         )
                         if cut is not None:
                             retry = expression.match(working, start, start + cut)
@@ -1426,10 +1436,29 @@ _HEX_TOKEN_MINIMUM = 8
 _HEX_CHARACTER = re.compile(r"[0-9a-fA-F]")
 
 
-def _repeats(text: str, unit: str) -> bool:
-    """Whether ``text`` is ``unit`` once or more (case-insensitively)."""
-    count, rest = divmod(len(text), len(unit))
-    return not rest and text.lower() == unit.lower() * count
+def _root_length(text: str) -> int:
+    """Length of the shortest string ``text`` is a repetition of ("1212" -> 2),
+    via the KMP prefix function (linear on every Python version)."""
+    if not text:
+        return 0
+    border = [0] * len(text)
+    length = 0
+    for index in range(1, len(text)):
+        while length and text[index] != text[length]:
+            length = border[length - 1]
+        if text[index] == text[length]:
+            length += 1
+        border[index] = length
+    period = len(text) - border[-1]
+    return period if len(text) % period == 0 else len(text)
+
+
+def _repeats(folded: str, root: int, unit: str) -> bool:
+    """Whether ``folded`` (case-folded, with its root length) is ``unit`` once
+    or more, case-insensitively, in time linear in ``unit``: the unit must be a
+    whole number of roots, fit a whole number of times and start the text."""
+    unit = unit.lower()
+    return bool(unit) and not len(unit) % root and not len(folded) % len(unit) and folded.startswith(unit)
 
 
 def _is_hex_token(token: str) -> bool:
@@ -1495,6 +1524,7 @@ def _joined_word_cut(
     end: int,
     words: Container[str],
     longest: int,
+    compound_parts: Iterable[str],
 ) -> Optional[int]:
     """Where the plain word ends in a match that runs from it through symbols
     into the first letters of the next word ("hell|-Ll|oyd", "ass|-S|asha"),
@@ -1505,7 +1535,10 @@ def _joined_word_cut(
     match ("fu-ck|ing") nor a separator inside one dictionary word, often with
     its letter repeated around it ("cock*k|blocker", "ra|pis(s|t"). Symbols
     that stand for letters are no separator either: the profanity must match
-    without them ("lust**g|e" is "lusting", "hell-Ll" still "hellLl").
+    without them ("lust**g|e" is "lusting", "hell-Ll" still "hellLl"). Nor is
+    the separator a boundary when another profanity continues the word after
+    the match ("ass-hole|fuck"): cutting there would leave that profanity
+    inside an ordinary-looking word, where the substring guard protects it.
     """
     if end >= len(text) or not _LETTER.match(text, end):
         return None
@@ -1521,6 +1554,8 @@ def _joined_word_cut(
     after = _LETTERS_HEAD.match(text, start + joined.start(3), start + joined.start(3) + longest + 1)
     left, right = before.group(0).lower(), after.group(0).lower()
     if left + right in words or (left[-1:] == right[:1] and left + right[1:] in words):
+        return None
+    if _starts_with_profanity(right[len(joined.group(3)) :], compound_parts):
         return None
     return joined.end(1)
 

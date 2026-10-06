@@ -1,5 +1,24 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening, Codex review pass 7)
+- P2 joined-word cut vs compounds: "ass-holefuck" was cut to "ass", leaving
+  "fuck" protected inside "holefuck" (unchanged at minimum_severity="high").
+  `_joined_word_cut` keeps the longer match when the letters after it start
+  another profanity (`_starts_with_profanity` over `compound_parts`); the next
+  profanity then abuts a match and counts as a compound. Results equal pass 5
+  (r6) for ass-holefuck/-bitch, sh-itfuck, fu-ckshit, cock-suckerass at every
+  severity level; hell-Lloyd, shit-tom, ass-Sasha stay apart.
+- P2 hex exemption with distinct matches in one token: replaced the
+  per-(token, match) verdict cache with a per-token summary (case-folded text
+  and its shortest repeated unit, `_root_length`, KMP prefix function, linear
+  on 3.9 too); `_repeats(folded, root, unit)` is O(len(unit)): the unit must
+  be a whole number of roots, divide the token and start it. 16000 distinct
+  "ab"/"8" matches: 4.08s (x11.4 per 4x) -> 0.58s (x4.1); regression test.
+- Differential vs pass 6 (r7), all corpora x 4 languages: 0 lost, 0 gained,
+  2 mask changes (split French "ass:ssassin(s)" under the English filter,
+  back to the pass-5 mask). Windowed/compacted vs full scan: 0 diffs.
+  Dictionary scan: 845, identical to passes 5 and 6.
+
 ## 2026-10-06 (fix/codex-review-hardening, Codex review pass 6)
 - P1 word-gap retry was quadratic: `_WORD_GAP` re-ran from every position of
   a long symbol run ("h e l" + "!£" * 8000: 3.2s, x10 per 4x). Gaps are now

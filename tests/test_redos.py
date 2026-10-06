@@ -211,6 +211,26 @@ def test_repeated_hex_like_block_entries_scale_linearly(word):
     assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
 
 
+def _distinct_hex_matches(n):
+    # One long hex-like token holding n distinct matches of "ab" and "8".
+    return "x" + "".join("a" + "".join(("b" if bit == "0" else "8") + "b8" for bit in format(k, "016b")) for k in range(n)) + "x"
+
+
+def test_distinct_block_matches_in_one_hex_token_scale_linearly():
+    # The exemption was cached per distinct match text, so each new one compared
+    # the whole token again: 16000 such matches took ~4.1s, 11x a quarter of them.
+    data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
+    alone = ProfanityFilter(allow=data["profanities"], block=["ab", "8"])
+    small = _best_of_two(alone, _distinct_hex_matches(4000))
+    large = _best_of_two(alone, _distinct_hex_matches(16000))
+    assert alone.check(_distinct_hex_matches(100)).is_clean  # not the block word repeated
+    # The block word "ab" matched as "ab8" fills "ab8ab8ab8" but not "ab8ab8ab".
+    assert alone.check("ab8ab8ab8").clean == "*" * 9
+    assert alone.check("ab8ab8ab").is_clean
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+
+
 def test_match_dense_text_scales_linearly():
     # Masking used to copy the working text and shift index lists per match,
     # so "shit " * 128000 took ~5.7s and * 512000 ~80s with a one-word filter.

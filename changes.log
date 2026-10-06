@@ -1,5 +1,39 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening, Codex review pass 5)
+- P2 cross-word retry at any separator: a candidate rejected for running into
+  the next word is re-matched before each gap between words in it, last gap
+  first, cutting before the gap's symbols and then at its spaces
+  (`_retry_before_word_gap`, `_WORD_GAP`); "hell - Lloyd", "hell / Lloyd" and
+  every other bundled separator now give "**** <sep> Lloyd".
+- P2 run shortening redesigned as one mechanism (`_RunShortener`, replaces
+  `_shorten_runs_with_mapping` and `long_run_pattern`): characters are grouped
+  by a signature over every letter class, separator set, literal and "\w"
+  the expressions use (case-insensitive, as they match), so "uUüÜ" is one run
+  in English; literal characters and characters a multi-character option
+  repeats (German "ck", "ss") only run with their own case variants; the
+  first and last character of a run are kept. Only runs of letter-class
+  characters are shortened ("-" * 8 and emoji runs are matched as they are).
+  Kept length per class: the bundled words' old floor, the class's own word
+  and option runs (a block word "x" * 300 no longer keeps "u" runs at 300),
+  8 for hex digits (the hex guard sees identifiers at their length), and
+  congruent to the run length modulo every literal run of the character with
+  the cut on a multiple of it, so complete literal occurrences stay complete.
+  Tokenization moved to `_tokenize` (cached) for reuse.
+- P2 hex guard: a hex-like token made only of an explicit block word, once or
+  repeated ("12121212" for "1212", "0" * 12 for "00"), is exempt (`_repeats`).
+- P2 invisible characters in entries: regex-driver block/allow entries drop
+  invisible characters like the text (blank afterwards = ignored; the literal
+  driver keeps entries as typed), and variation selectors and emoji tag
+  characters after a match are masked with it (`_modifies_previous`).
+- Empty character classes (a dictionary without letters, e.g. only
+  block=["--"] after allowing every bundled word) compile to "(?!)".
+- Differential vs pass 4 (r5): every corpus x every language (36 runs) 0
+  lost / 0 gained / 0 mask or match changes; targeted corpus (mixed-case
+  stretched bundled words, profanity + separator + next word): 0 lost.
+  Windowed/compacted vs full scan: 0 diffs over 3060 texts x 2 x 4 languages.
+  Dictionary scan: 845 flagged, identical set and masks.
+
 ## 2026-10-06 (fix/codex-review-hardening, Codex review pass 4)
 - P2 rare-double chains: protected candidates that would qualify with a
   profane neighbour are kept pending (`_chain_need`) and resolved per pass by

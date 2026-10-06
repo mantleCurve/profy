@@ -4,8 +4,10 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
+from itertools import chain, groupby
 import json
 from importlib import resources
+from math import lcm
 import re
 from types import MappingProxyType
 import unicodedata
@@ -125,11 +127,13 @@ class ProfanityFilter:
         driver: str = "regex",
     ) -> None:
         self.languages = list(_available_languages()) if all_languages else _coerce_languages(languages)
-        self.allow = set(_coerce_words(allow, "allow"))
-        self.block = set(_coerce_words(block, "block"))
+        self.driver = _coerce_driver(driver)
+        # Entries are normalized like the text the driver matches: the regex
+        # driver ignores invisible characters, the literal driver does not.
+        self.allow = set(_coerce_words(allow, "allow", strip_invisible=self.driver == "regex"))
+        self.block = set(_coerce_words(block, "block", strip_invisible=self.driver == "regex"))
         self.mask = mask
         self.minimum_severity = _coerce_severity(minimum_severity)
-        self.driver = _coerce_driver(driver)
         self.dictionary = _cached_dictionary(
             tuple(self.languages),
             all_languages or len(self.languages) > 1,
@@ -151,16 +155,10 @@ class ProfanityFilter:
 
         normalized, normalized_map = self.dictionary.normalize_with_mapping(text, text_map)
         normalized, normalized_map = _collapse_whitespace_with_mapping(normalized, normalized_map)
-        # A run of one character longer than any dictionary word needs
-        # ("fuuuuuuuuu...ck", "*" * 1000) is shortened for matching only; the
-        # last kept character maps to the rest of the original run, so masks
-        # still cover it.
-        normalized, normalized_map = _shorten_runs_with_mapping(
-            normalized,
-            normalized_map,
-            self.dictionary.long_run_pattern,
-            self.dictionary.longest_run,
-        )
+        # Runs of interchangeable characters longer than any dictionary word
+        # needs ("fuuuuuuuuu...ck", "fuUuUuU...ck", "*" * 1000) are shortened for
+        # matching only; masks still cover the whole original run.
+        normalized, normalized_map = self.dictionary.runs.shorten(normalized, normalized_map)
         immutable_normalized = normalized
         expressions = self.dictionary.sorted_expressions
         dictionary = self.dictionary
@@ -217,6 +215,10 @@ class ProfanityFilter:
                 if self.minimum_severity is not None and not severity.is_at_least(self.minimum_severity):
                     return
                 original_start, original_end = _original_span(working_map, start, end)
+                # Variation selectors and tag characters belong to the character
+                # before them ("\u2764\ufe0f"), so they are masked along with it.
+                while original_end < len(original) and _modifies_previous(original[original_end]):
+                    original_end += 1
                 if claimed.find(1, original_start, original_end) != -1:
                     return
                 claimed[original_start:original_end] = b"\x01" * (original_end - original_start)
@@ -240,11 +242,11 @@ class ProfanityFilter:
                 for start, end, matched_text in candidates:
 
                     if _is_spanning_word_boundary(matched_text, working, start):
-                        # Rejected for running across a phrase break ("hell, Ll|oyd");
-                        # the same profanity may still match before the break.
-                        cut = _PHRASE_BREAK.search(matched_text)
-                        retry = expression.match(working, start, start + cut.start()) if cut else None
-                        if retry is None or _is_spanning_word_boundary(retry.group(0), working, start):
+                        # Rejected for running into the next word ("hell, Ll|oyd",
+                        # "hell - Ll|oyd"); the same profanity may still match
+                        # before the gap between the words.
+                        retry = _retry_before_word_gap(expression, working, start, matched_text)
+                        if retry is None:
                             continue
                         end = retry.end()
                         matched_text = retry.group(0)
@@ -257,10 +259,10 @@ class ProfanityFilter:
                     token = hex_runs.around(start, end)
                     if token not in hex_verdicts:
                         hex_verdicts[token] = _is_hex_token(working[token[0] : token[1]])
-                    # An explicit block word that is the whole token is masked
-                    # anyway ("deadbeef1", "12345678").
+                    # An explicit block word that is the whole token, alone or
+                    # repeated, is masked anyway ("deadbeef1", "12345678", "1212|1212").
                     if hex_verdicts[token] and not (
-                        base in dictionary.blocked and working[token[0] : token[1]].strip("-") == matched_text
+                        base in dictionary.blocked and _repeats(working[token[0] : token[1]].strip("-"), matched_text)
                     ):
                         continue
 
@@ -416,19 +418,18 @@ class _Dictionary:
         languages: list[str],
         driver: str = "regex",
         blocked: Iterable[str] = (),
+        bundled: Iterable[str] = (),
     ) -> None:
         # Instances are cached and shared between filters, so expose read-only views.
         self.profanities = tuple(profanities)
         self.false_positives = frozenset(false_positives)
         self.severity_map = MappingProxyType(dict(severity_map))
         self.languages = list(languages)
-        self.longest_run = _longest_needed_run(profanities, substitutions)
         # Parts that make a word a compound of profanities ("hell|fuck"), and how
         # far around a match the substring guard needs to look.
         self.compound_parts = frozenset(word.lower() for word in profanities if len(word) >= 3)
         self.context_window = max([len(part) for part in self.compound_parts] + [_LONGEST_SUFFIX + 1])
         self.longest_false_positive = max([0] + [len(word) for word in self.false_positives])
-        self.long_run_pattern = rf"(.)\1{{{self.longest_run},}}"
         # Stop classes of the generated expressions (see _compile_profanity),
         # keyed by id(): hashing a compiled pattern re-hashes its whole program.
         # The expressions live as long as this dictionary, so ids stay unique.
@@ -438,6 +439,15 @@ class _Dictionary:
         else:
             self.expressions, stops = _generate_reaching_expressions(profanities, separators, substitutions)
             self.stops = {id(expression): stop for expression, stop in stops.items()}
+            # Runs keep at least what the language's own words need; block-list
+            # words only lengthen the runs of their own characters (a block word
+            # "x" * 300 must not keep "u" runs too long to match "fuu...ck").
+            ordered = _ordered_substitutions(substitutions)
+            self.runs = _RunShortener(
+                {word: _tokenize(word, ordered) for word in profanities},
+                separators,
+                _longest_needed_run(bundled, substitutions),
+            )
         # Longest first; among equally long words an explicitly blocked one goes
         # first, so it always matches its own text ("*6zy" before "fagz").
         blocked = frozenset(blocked)
@@ -484,6 +494,7 @@ class _Dictionary:
                         existing.append(value)
 
         known = {word.lower() for word in profanities}
+        bundled = [word for word in profanities if word.lower() not in allow]
         for word in block:
             # Like Blasp, only words new to the dictionary default to HIGH; blocking
             # an existing word keeps its curated severity. An explicit block also
@@ -504,6 +515,7 @@ class _Dictionary:
             languages=languages,
             driver=driver,
             blocked=block,
+            bundled=bundled,
         )
 
     def severity_for(self, word: str) -> Severity:
@@ -566,6 +578,173 @@ def _longest_needed_run(profanities: Iterable[str], substitutions: Mapping[str, 
     return max([3] + word_runs + option_runs)
 
 
+# Runs short enough that no shortening can apply (every run keeps at least 3).
+_LONG_RUN = re.compile(r"(.)\1{3,}", re.DOTALL)
+_REPEATED = re.compile(r"(.)\1+", re.DOTALL)
+_WORD_CHARACTER = re.compile(r"\w")
+
+
+class _RunShortener:
+    """Shortens long runs of interchangeable characters, for matching only.
+
+    Letter runs inside an expression are bounded (see ``_RUN_LENGTH_LIMIT``), so
+    a run longer than any word needs ("fuuu...ck", "fuUuU...ck", "*" * 1000) is
+    cut down before matching. The cut removes characters from inside the run
+    and the kept character right after the cut stands for all of them, so a
+    mask over it covers the whole original run and every original character
+    still maps to exactly one kept one.
+
+    Two characters are interchangeable when no generated expression can tell
+    them apart: every letter class, separator set and literal the expressions
+    are built from contains both or neither (case-insensitively, as the
+    expressions match), so "u", "U" and "ü" form one run in English. The
+    characters of a literal, and those a multi-character option repeats (the
+    "s" of "ss"), only run with their own case variants, and the first and
+    last character of a run are always kept, so an option reaching into the
+    run from outside ("ue" after "...u") reads the same text.
+
+    Only runs of characters a letter class accepts are shortened: nothing else
+    repeats inside an expression (separator gaps hold at most
+    ``_SEPARATOR_LIMIT`` characters, literals one each), so other runs ("-" * 8,
+    emoji) are matched as they are. A run keeps at least ``floor`` characters
+    (``_HEX_TOKEN_MINIMUM`` for hexadecimal digits) and as many as any word or
+    repeated option needs in a row (see ``_longest_needed_run``). For
+    characters that also occur as literals the kept length is congruent to
+    the run length modulo every literal run of them ("00" in "b00bs", a block
+    word "**") and the cut starts a multiple of it into the run, so complete
+    occurrences stay complete.
+    """
+
+    def __init__(self, tokenized: Mapping[str, tuple[_Token, ...]], separators: Iterable[str], floor: int) -> None:
+        classes: set[frozenset] = set()
+        literals: set[str] = set()
+        options: set[str] = set()
+        for token in set(chain.from_iterable(tokenized.values())):
+            if token.literal is not None:
+                literals.add(token.literal)
+                continue
+            # What the token accepts, and what the letter before it sees as its
+            # possible start (see _follow_chars).
+            classes.add(token.chars)
+            classes.add(token.chars | {option[0] for option in token.multi})
+            options.update(token.multi)
+        classes.discard(frozenset())
+        letters = frozenset().union(*classes)
+        sets = list(classes) + [frozenset(separators), frozenset("."), *(frozenset(item) for item in literals)]
+        sets.append(frozenset().union(letters, *sets, *options))
+        self._floor = floor
+        self._letters = _class_pattern(letters)
+        self._readable = _class_pattern(sets[-1])
+        self._sets = [_class_pattern(chars) for chars in sets if chars]
+        self._by_signature: dict[int, str] = {}
+        self._representatives: dict[str, str] = {}
+        # A multi-character option reading two characters of one class tells
+        # them apart (German substitutes "c" and "k" for each other, but the
+        # option "ck" does not match "kc"): those only run with their own case
+        # variants.
+        repeated = set()
+        for option in options:
+            keys = [self._representative(character) for character in option]
+            repeated.update(character for character, key in zip(option, keys) if keys.count(key) > 1)
+        if repeated:
+            self._sets.extend(_class_pattern(character) for character in sorted(repeated))
+            self._by_signature.clear()
+            self._representatives.clear()
+
+        # Word characters by class; one no expression reads (a key none of its
+        # own options spells) stays itself.
+        table = {
+            ord(character): self._representative(character) or character for character in set("".join(tokenized))
+        }
+        needed: dict[str, int] = {}
+        periods: dict[str, int] = {}
+        for word, tokens in tokenized.items():
+            repeats = list(_REPEATED.finditer(word.translate(table)))
+            for repeat in repeats:
+                needed[repeat.group(1)] = max(needed.get(repeat.group(1), 0), len(repeat.group(0)))
+            if repeats:
+                literal_keys = (table[ord(token.literal)] if token.literal is not None else None for token in tokens)
+                for key, group in groupby(literal_keys):
+                    if key is not None:
+                        periods[key] = lcm(periods.get(key, 1), sum(1 for _ in group))
+        for option in options:
+            for repeat in _REPEATED.finditer(option.translate(table)):
+                needed[repeat.group(1)] = max(needed.get(repeat.group(1), 0), 2 * len(repeat.group(0)))
+        self._needed = needed
+        self._periods = periods
+        # Representative -> (characters to keep, period), or None when no letter
+        # class accepts the characters.
+        self._limits: dict[str, Optional[tuple[int, int]]] = {}
+
+    def _representative(self, character: str) -> Optional[str]:
+        """The first seen character interchangeable with ``character``, or None
+        when no expression reads it. Only readable characters are cached, so
+        the cache is bounded by the dictionary, not by the input."""
+        representative = self._representatives.get(character)
+        if representative is None:
+            if not self._readable.fullmatch(character):
+                return None
+            signature = sum(1 << index for index, chars in enumerate(self._sets) if chars.fullmatch(character))
+            if _WORD_CHARACTER.match(character):
+                signature |= 1 << len(self._sets)
+            representative = self._by_signature.setdefault(signature, character)
+            self._representatives[character] = representative
+        return representative
+
+    def _limits_for(self, representative: str) -> Optional[tuple[int, int]]:
+        if representative not in self._limits:
+            limits = None
+            if self._letters.fullmatch(representative):
+                period = self._periods.get(representative, 1)
+                limits = (max(self._floor, self._needed.get(representative, 0), period), period)
+            self._limits[representative] = limits
+        return self._limits[representative]
+
+    def shorten(self, text: str, span_map: list[tuple[int, int]]) -> tuple[str, list[tuple[int, int]]]:
+        # Runs are found on a copy where interchangeable characters are equal.
+        table: dict[int, str] = {}
+        for character in set(text):
+            representative = self._representative(character)
+            if representative is not None and self._limits_for(representative) is not None:
+                table[ord(character)] = representative
+        canonical = text.translate(table)
+        pieces: list[str] = []
+        mapped: list[tuple[int, int]] = []
+        cursor = 0
+        for run in _LONG_RUN.finditer(canonical):
+            limits = self._limits.get(run.group(1))
+            if limits is None:
+                continue
+            keep, period = limits
+            start, end = run.span()
+            if _HEX_CHARACTER.match(text, start):
+                # The hex/UUID guard must still see a long identifier as long.
+                keep = max(keep, _HEX_TOKEN_MINIMUM)
+            # The smallest length >= keep that is congruent to the run's length
+            # modulo the period.
+            keep += (end - start - keep) % period
+            if end - start <= keep:
+                continue
+            removed = end - start - keep
+            # The kept character at ``cut`` is the one after the removed ones.
+            cut = start + period * (keep // period - 1)
+            pieces.append(text[cursor:cut])
+            mapped.extend(span_map[cursor:cut])
+            pieces.append(text[cut + removed])
+            mapped.append(_original_span(span_map, cut, cut + removed + 1))
+            cursor = cut + removed + 1
+        pieces.append(text[cursor:])
+        mapped.extend(span_map[cursor:])
+        return "".join(pieces), mapped
+
+
+def _class_pattern(chars: Iterable[str]) -> re.Pattern[str]:
+    # An empty class (a dictionary without letters, e.g. only block=["--"])
+    # matches nothing.
+    members = "".join(_class_members(chars))
+    return re.compile("[" + members + "]" if members else "(?!)", re.IGNORECASE | re.UNICODE)
+
+
 _VOWEL_KEYS = frozenset("aeiou")
 _MIN_CONSONANTS_FOR_ELISION = 3
 # Upper bound of separator characters between two letters ("f-*-ck").
@@ -626,12 +805,7 @@ def _generate_reaching_expressions(
 ) -> tuple[dict[str, re.Pattern[str]], dict[re.Pattern[str], re.Pattern[str]]]:
     """The expressions, and for each one the class of characters it never
     reads past (see ``_compile_profanity``)."""
-    options_by_key = {
-        character.strip("/"): tuple(options)
-        for character, options in substitutions.items()
-        if character.strip("/")
-    }
-    ordered = tuple(sorted(options_by_key.items(), key=lambda item: len(item[0]), reverse=True))
+    ordered = _ordered_substitutions(substitutions)
     compiled = {profanity: _compile_profanity(profanity, ordered, tuple(separators)) for profanity in profanities}
     return (
         {profanity: pair[0] for profanity, pair in compiled.items()},
@@ -658,6 +832,30 @@ def _compile_profanity(
     is the first stop character at or after ``p``. The confirming passes rely
     on this to rescan only where masking changed the text.
     """
+    tokens = _tokenize(profanity, ordered)
+    readable: set[str] = set(separators)
+    for token in tokens:
+        readable.update(token.chars)
+        readable.update(character for option in token.multi for character in option)
+        if token.literal is not None:
+            readable.add(token.literal)
+    stop = re.compile(r"[^\s" + "".join(_class_members(readable)) + "]", re.IGNORECASE | re.UNICODE)
+    return re.compile(_tokens_expression(list(tokens), separators), re.IGNORECASE | re.UNICODE), stop
+
+
+def _ordered_substitutions(substitutions: Mapping[str, list[str]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Substitution options by key (slashes stripped), longest key first."""
+    options_by_key = {
+        character.strip("/"): tuple(options)
+        for character, options in substitutions.items()
+        if character.strip("/")
+    }
+    return tuple(sorted(options_by_key.items(), key=lambda item: len(item[0]), reverse=True))
+
+
+@lru_cache(maxsize=16384)
+def _tokenize(profanity: str, ordered: tuple[tuple[str, tuple[str, ...]], ...]) -> tuple[_Token, ...]:
+    """The positions of one profanity: substitution sets, or literal characters."""
     lowered = profanity.lower()
     vowel_positions = [index for index, character in enumerate(lowered) if character in _VOWEL_KEYS]
     consonant_letters = sum(
@@ -679,14 +877,7 @@ def _compile_profanity(
         else:
             tokens.append(_Token(frozenset(), (), literal=profanity[i]))
             i += 1
-    readable: set[str] = set(separators)
-    for token in tokens:
-        readable.update(token.chars)
-        readable.update(character for option in token.multi for character in option)
-        if token.literal is not None:
-            readable.add(token.literal)
-    stop = re.compile(r"[^\s" + "".join(_class_members(readable)) + "]", re.IGNORECASE | re.UNICODE)
-    return re.compile(_tokens_expression(tokens, separators), re.IGNORECASE | re.UNICODE), stop
+    return tuple(tokens)
 
 
 def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
@@ -1170,6 +1361,17 @@ class _RunIndex:
         return left, right
 
 
+# Fewest hexadecimal characters that make an identifier (see _is_hex_token).
+_HEX_TOKEN_MINIMUM = 8
+_HEX_CHARACTER = re.compile(r"[0-9a-fA-F]")
+
+
+def _repeats(text: str, unit: str) -> bool:
+    """Whether ``text`` is ``unit`` once or more (case-insensitively)."""
+    count, rest = divmod(len(text), len(unit))
+    return not rest and text.lower() == unit.lower() * count
+
+
 def _is_hex_token(token: str) -> bool:
     """Whether a token (a match plus the hex characters around it) is a UUID or
     a long hexadecimal identifier rather than a word."""
@@ -1182,7 +1384,7 @@ def _is_hex_token(token: str) -> bool:
         return True
     stripped = token.replace("-", "")
     return (
-        len(stripped) >= 8
+        len(stripped) >= _HEX_TOKEN_MINIMUM
         and bool(re.fullmatch(r"[0-9a-fA-F]+", stripped))
         and bool(re.search(r"\d", stripped))
     )
@@ -1225,7 +1427,29 @@ def _is_spanning_word_boundary(matched: str, full_text: str, start: int) -> bool
     return not _has_letter_and_nonletter(parts[:-1])
 
 
+def _retry_before_word_gap(
+    expression: re.Pattern[str],
+    text: str,
+    start: int,
+    matched: str,
+) -> Optional[re.Match[str]]:
+    """The longest match of ``expression`` at ``start`` that stops before one of
+    the gaps between words in ``matched`` and does not span a word boundary
+    itself, or None."""
+    for gap in reversed(list(_WORD_GAP.finditer(matched))):
+        # Before the gap's symbols first ("hell|! Ll"), then at each space in
+        # it, last first ("fu**| - k").
+        spaces = reversed([gap.start() + space.start() for space in re.finditer(r"\s+", gap.group(0))])
+        for cut in dict.fromkeys([gap.start(), *spaces]):
+            retry = expression.match(text, start, start + cut)
+            if retry is not None and not _is_spanning_word_boundary(retry.group(0), text, start):
+                return retry
+    return None
+
+
 _PHRASE_BREAK = re.compile(r"[,.;:?!]\s|\s[,.;:?!]")
+# Whitespace between words with the symbols around it (", ", " - ", " / ").
+_WORD_GAP = re.compile(r"[^\w\s]*(?:\s+[^\w\s]*)+")
 # Inflectional endings (plural, past, participle, comparative, superlative,
 # adverb) including the y -> i spellings ("shittier", "crappiest"), plus "-y"
 # and "-iness" adjective/noun forms.
@@ -1397,7 +1621,7 @@ def _coerce_languages(languages: Union[str, Iterable[str]]) -> list[str]:
     return selected
 
 
-def _coerce_words(words: Iterable[str], option: str) -> frozenset[str]:
+def _coerce_words(words: Iterable[str], option: str, *, strip_invisible: bool = False) -> frozenset[str]:
     # A bare string is one word, not an iterable of letters. Blank entries are
     # ignored: an empty pattern would match everywhere without consuming text.
     items = [words] if isinstance(words, str) else words
@@ -1405,6 +1629,10 @@ def _coerce_words(words: Iterable[str], option: str) -> frozenset[str]:
     for word in items:
         if not isinstance(word, str):
             raise TypeError(f"{option} entries must be strings, not {type(word).__name__}")
+        if strip_invisible:
+            # The checked text loses its invisible characters before matching,
+            # so an entry keeping them ("\u2764\ufe0f") could never match.
+            word = "".join(character for character in word if not _is_invisible(character))
         # Whitespace inside an entry is collapsed like the checked text is.
         word = " ".join(word.split()).lower()
         if word:
@@ -1431,6 +1659,16 @@ def _is_invisible(character: str) -> bool:
         unicodedata.category(character) == "Cf"
         or "\ufe00" <= character <= "\ufe0f"
         or "\U000e0100" <= character <= "\U000e01ef"
+    )
+
+
+def _modifies_previous(character: str) -> bool:
+    # Invisible characters that extend the character before them into one
+    # grapheme (UAX #29): variation selectors and emoji tag characters.
+    return (
+        "\ufe00" <= character <= "\ufe0f"
+        or "\U000e0100" <= character <= "\U000e01ef"
+        or "\U000e0020" <= character <= "\U000e007f"
     )
 
 
@@ -1472,26 +1710,6 @@ def _replace_with_mapping(
         mapped.extend((original_start, original_end) for _ in replacement_text)
         cursor = end
 
-    pieces.append(text[cursor:])
-    mapped.extend(span_map[cursor:])
-    return "".join(pieces), mapped
-
-
-def _shorten_runs_with_mapping(
-    text: str,
-    span_map: list[tuple[int, int]],
-    pattern: str,
-    keep: int,
-) -> tuple[str, list[tuple[int, int]]]:
-    pieces: list[str] = []
-    mapped: list[tuple[int, int]] = []
-    cursor = 0
-    for match in re.finditer(pattern, text):
-        start, end = match.span()
-        pieces.append(text[cursor : start + keep])
-        mapped.extend(span_map[cursor : start + keep - 1])
-        mapped.append((span_map[start + keep - 1][0], span_map[end - 1][1]))
-        cursor = end
     pieces.append(text[cursor:])
     mapped.extend(span_map[cursor:])
     return "".join(pieces), mapped

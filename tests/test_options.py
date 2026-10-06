@@ -1,3 +1,4 @@
+import json
 import random
 import string
 import threading
@@ -6,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from helpers import run_isolated
+from helpers import ROOT, run_isolated
 from profy import ProfanityFilter, Severity, check_text, clean_text, filter_text
 from profy import core
 
@@ -257,22 +258,109 @@ BLOCK_WORDS = [
 ]
 
 
+# Entries with invisible characters: zero-width space and joiner, variation
+# selectors, a ZWJ emoji sequence and an emoji tag sequence (Scotland's flag).
+INVISIBLE_BLOCK_WORDS = [
+    "\u2764\ufe0f", "x\ufe0f", "a\u200bb", "sh\u200bip", "\u200bab", "ab\u200b", "a\u200d\u200db", "tic\u200b tac",
+    "\U0001F469\u200d\U0001F4BB", "\U0001F3F3\ufe0f\u200d\U0001F308", "\U0001F44D\U000E0100",
+    "\U0001F3F4\U000E0067\U000E0062\U000E0073\U000E0063\U000E0074\U000E007F", "\u200b", "\ufe0f \u200d",
+]
+
+
 def _random_block_words(count):
     rng = random.Random(20261006)
-    alphabet = string.ascii_letters + string.digits + "-'_.!*@ \u00e4\u00f6\u00fc\u00e9"
+    alphabet = string.ascii_letters + string.digits + "-'_.!*@ \u00e4\u00f6\u00fc\u00e9\u200b\u200d\ufe0f"
     words = ("".join(rng.choice(alphabet) for _ in range(rng.randint(1, 14))) for _ in range(count))
     return [word for word in words if word.strip()]
 
 
+def _modifies_previous(character):
+    # Variation selectors and emoji tag characters.
+    return "\ufe00" <= character <= "\ufe0f" or "\U000e0100" <= character <= "\U000e01ef" or (
+        "\U000e0020" <= character <= "\U000e007f"
+    )
+
+
+def _expected_own_mask(word, driver):
+    if driver == "pattern":
+        # Entries match literally, invisible characters included.
+        stripped = word.strip()
+        lead = word[: len(word) - len(word.lstrip())]
+        return lead + "*" * len(stripped) + word[len(lead) + len(stripped) :]
+    # The regex driver ignores invisible characters in entries as in the text:
+    # the mask runs from the first to the last visible character, plus the
+    # selectors and tags that belong to it; an entry with nothing visible is
+    # blank and ignored.
+    visible = [index for index, character in enumerate(word) if not character.isspace() and not core._is_invisible(character)]
+    if not visible:
+        return word
+    start, end = visible[0], visible[-1] + 1
+    while end < len(word) and _modifies_previous(word[end]):
+        end += 1
+    return word[:start] + "*" * (end - start) + word[end:]
+
+
 @pytest.mark.parametrize("driver", ["regex", "pattern"])
 def test_a_block_word_always_masks_its_own_text(driver):
-    for word in BLOCK_WORDS + _random_block_words(300):
+    for word in BLOCK_WORDS + INVISIBLE_BLOCK_WORDS + _random_block_words(300):
         result = filter_text(word, block=[word], driver=driver)
-        core = word.strip()
-        lead = word[: len(word) - len(word.lstrip())]
-        expected = lead + "*" * len(core) + word[len(lead) + len(core) :]
         assert result.original == word
-        assert result.clean == expected, (driver, word, result.clean)
+        assert result.clean == _expected_own_mask(word, driver), (driver, word, result.clean)
+
+
+# Units no Scunthorpe rule protects (two plain letters repeated, "abab", read as
+# an ordinary longer word): emoji, separators, symbols that also stand for
+# letters, digits (hex-like runs), accented letters and mixed units.
+REPEATED_UNITS = [
+    "\U0001F4A9", "-", "#", "_", "*", "!", "$", "0", "9", "x", "\u00e9", "12", "a1", "zqx", "\U0001F4A9-", "!-",
+]
+
+
+def _single_word_filter(word):
+    # Only the block word: a fast filter that also shortens runs as far as
+    # possible (bundled words keep at least seven of a run in English).
+    data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
+    return ProfanityFilter(allow=[item for item in data["profanities"] if item.lower() != word], block=[word])
+
+
+@pytest.mark.parametrize("unit", REPEATED_UNITS)
+def test_runs_of_a_repeated_unit_block_word_are_masked_completely(english, unit):
+    # Run shortening cut "-" * 8 to seven characters, so with block=["--"] only
+    # three "--" were masked and "******--" came back.
+    for times in (1, 2, 3):
+        word = unit * times
+        alone = _single_word_filter(word)
+        bundled = ProfanityFilter(block=[word])
+        for count in range(1, 201):
+            text = word * count
+            assert alone.check(text).clean == "*" * len(text), (word, count)
+            if count < 12 or count in (63, 64, 65, 128, 199, 200):
+                assert bundled.check(text).clean == "*" * len(text), (word, count)
+
+
+def test_runs_of_a_repeated_block_word_keep_their_incomplete_rest():
+    # Complete occurrences are masked; a leftover shorter than the word is not.
+    assert filter_text("-" * 9, block=["--"]).clean == "*" * 8 + "-"
+    assert filter_text("\U0001F4A9" * 8, block=["\U0001F4A9" * 3]).clean == "*" * 6 + "\U0001F4A9" * 2
+    assert filter_text("!" * 101, block=["!!"]).clean == "*" * 100 + "!"
+
+
+def test_hex_like_runs_of_a_block_word_are_masked_only_when_complete():
+    # A hex-like token made of nothing but the block word is masked; one with
+    # a leftover stays protected, at any run length.
+    assert filter_text("12121212", block=["1212"]).clean == "*" * 8
+    assert filter_text("0" * 12, block=["00"]).clean == "*" * 12
+    assert filter_text("0" * 11, block=["00"]).clean == "0" * 11
+    assert filter_text("9" * 100, block=["9" * 40]).clean == "9" * 100
+    assert filter_text("9" * 120, block=["9" * 40]).clean == "*" * 120
+
+
+def test_block_words_with_long_runs_do_not_affect_other_letters():
+    # A run is kept as long as the words need it for that character only: a
+    # block word "x" * 300 used to keep "u" runs too long to match.
+    stretched = "f" + "u" * 100 + "ck"
+    assert filter_text(stretched, block=["x" * 300]).clean == "*" * len(stretched)
+    assert filter_text("x" * 600, block=["x" * 300]).clean == "*" * 600
 
 
 def test_block_words_inside_longer_hex_tokens_stay_protected():

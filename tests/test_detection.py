@@ -1,8 +1,13 @@
+import json
+import random
 import time
 
 import pytest
 
+from helpers import ROOT
 from profy import Match, ProfanityFilter, Severity, ShieldResult, filter_text
+
+SEPARATORS = json.loads((ROOT / "profy" / "data" / "global.json").read_text(encoding="utf-8"))["separators"]
 
 
 @pytest.mark.parametrize(
@@ -208,6 +213,19 @@ def test_profanity_before_a_word_starting_with_its_last_letters(english, text, c
     assert english.check(text).clean == clean
 
 
+@pytest.mark.parametrize("separator", SEPARATORS)
+def test_a_match_running_into_the_next_word_is_retried_before_any_separator(english, separator):
+    # "hell - Ll|oyd" ran into the next word and was rejected; the shorter
+    # match was only retried before phrase-break punctuation (",", ";", ...).
+    for text, clean in [
+        (f"hell {separator} Lloyd", f"**** {separator} Lloyd"),
+        (f"Hell {separator} llama", f"**** {separator} llama"),
+        (f"hell{separator} Lloyd", f"****{separator} Lloyd"),
+        (f"ass {separator} sam", f"*** {separator} sam"),
+    ]:
+        assert english.check(text).clean == clean, text
+
+
 @pytest.mark.parametrize(
     "text, clean",
     [
@@ -319,6 +337,37 @@ def test_very_long_letter_runs_are_masked_entirely(text, options):
     # still covers the whole original run.
     result = filter_text(text, **options)
     assert result.clean == "*" * len(text)
+
+
+# Characters no expression tells apart from "u" in English: its case variants
+# and accented forms ("@" and "*" also stand for other letters).
+U_VARIANTS = "uU\u00fc\u00dc\u00fb\u00db\u00f9\u00d9\u00fa\u00da\u016b\u016a\u00b5"
+
+
+def test_runs_of_mixed_letter_variants_of_any_length_are_caught(english):
+    # Only identical characters used to be shortened, so a mixed run longer
+    # than the 64 characters a letter may match ("uU" * 33) went undetected.
+    rng = random.Random(20261006)
+    for length in range(1, 501):
+        text = "f" + "".join(rng.choice(U_VARIANTS) for _ in range(length)) + "ck"
+        assert english.check(text).clean == "*" * len(text), text
+
+
+@pytest.mark.parametrize(
+    "text, options",
+    [
+        pytest.param("f" + "uU" * 33 + "ck", {}, id="uU"),
+        pytest.param("f" + "u\u00fc" * 33 + "ck", {}, id="u-umlaut"),
+        pytest.param("sh" + "iI" * 100 + "t", {}, id="iI"),
+        pytest.param("b" + "oO" * 100 + "bs", {}, id="oO"),
+        pytest.param("f" + "uU" * 250 + "ck", {"all_languages": True}, id="uU-all"),
+        pytest.param("f" + "u\u00fc" * 250 + "ck", {"all_languages": True}, id="u-umlaut-all"),
+        pytest.param("p" + "u\u00faU\u00da" * 50 + "ta", {"languages": "spanish"}, id="spanish"),
+        pytest.param("m" + "e\u00e9E\u00c9" * 50 + "rde", {"languages": "french"}, id="french"),
+    ],
+)
+def test_alternating_case_and_accent_runs_are_caught(text, options):
+    assert filter_text(text, **options).clean == "*" * len(text)
 
 
 def test_vowel_elision_does_not_flag_unrelated_short_tokens(english):

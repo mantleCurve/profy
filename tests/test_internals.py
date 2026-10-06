@@ -249,7 +249,7 @@ def test_longest_needed_run():
     assert core._longest_needed_run(["ass"], {}) == 3
     assert core._longest_needed_run(["booooooobs"], {}) == 7
     assert core._longest_needed_run(["gilipollas"], {"/ll/": ["ll", "y"], "/x/": ["ks"]}) == 4
-    assert ProfanityFilter(languages="spanish").dictionary.long_run_pattern == r"(.)\1{4,}"
+    assert ProfanityFilter(languages="spanish").dictionary.runs._floor == 4
 
 
 def test_matches_never_share_original_characters():
@@ -266,10 +266,67 @@ def test_matches_never_share_original_characters():
     assert result.clean == "**#"
 
 
-def test_shorten_runs_with_mapping():
-    text, span_map = core._shorten_runs_with_mapping("xaaaaay", [(i, i + 1) for i in range(7)], r"(.)\1{3,}", 3)
-    assert text == "xaaay"
+def _shortener(words, substitutions, floor=3, separators=("-",)):
+    ordered = core._ordered_substitutions(substitutions)
+    return core._RunShortener({word: core._tokenize(word, ordered) for word in words}, separators, floor)
+
+
+def _identity_map(text):
+    return [(index, index + 1) for index in range(len(text))]
+
+
+def test_run_shortener_keeps_the_first_characters_and_the_last():
+    shortener = _shortener(["sz"], {"/s/": ["s", "\u0161", "\u00a7"], "/z/": ["z"]})
+    text, span_map = shortener.shorten("xsssssy", _identity_map("xsssssy"))
+    assert text == "xsssy"
     assert span_map == [(0, 1), (1, 2), (2, 3), (3, 6), (6, 7)]
+    # Interchangeable characters form one run; the last one is kept as is.
+    text, span_map = shortener.shorten("S\u0161sS\u0161sz", _identity_map("S\u0161sS\u0161sz"))
+    assert text == "S\u0161sz"
+    assert span_map == [(0, 1), (1, 2), (2, 6), (6, 7)]
+    # "\u00a7" is no word character, so "\w" tells it apart from "s". Runs the
+    # expressions cannot repeat (separators, unknown characters) and runs
+    # within the limit are left alone.
+    for unchanged in ["s\u00a7s\u00a7s\u00a7", "x----y", "x\U0001F4A9\U0001F4A9\U0001F4A9\U0001F4A9y", "sss", "s\u0161s"]:
+        assert shortener.shorten(unchanged, _identity_map(unchanged)) == (unchanged, _identity_map(unchanged))
+
+
+def test_run_shortener_keeps_complete_literal_occurrences():
+    # "$" is both a letter option and a literal; "$$" fixes a period of 2.
+    shortener = _shortener(["sz", "$$"], {"/s/": ["s", "$"], "/z/": ["z"]})
+    text, span_map = shortener.shorten("$" * 9, _identity_map("$" * 9))
+    assert text == "$" * 3
+    assert span_map == [(0, 7), (7, 8), (8, 9)]
+    text, span_map = shortener.shorten("$" * 10, _identity_map("$" * 10))
+    assert text == "$" * 4
+    assert span_map == [(0, 1), (1, 2), (2, 9), (9, 10)]
+    # A literal is not interchangeable with the letter it also stands for.
+    assert shortener.shorten("s$s$s$s$", _identity_map("s$s$s$s$"))[0] == "s$s$s$s$"
+
+
+def test_run_shortener_hex_digits_keep_an_identifier_long():
+    shortener = _shortener(["ab"], {"/a/": ["a"], "/b/": ["b"]})
+    assert shortener.shorten("a" * 20, _identity_map("a" * 20))[0] == "a" * 8
+
+
+def test_run_shortener_respects_options_that_repeat_a_class():
+    # "g" and "h" are interchangeable, but the option "gh" tells them apart.
+    together = _shortener(["g"], {"/g/": ["g", "h"], "/h/": ["h", "g"]})
+    apart = _shortener(["g"], {"/g/": ["g", "h", "gh"], "/h/": ["h", "g", "gh"]})
+    assert together.shorten("ghghgh", _identity_map("ghghgh"))[0] == "ghh"
+    assert apart.shorten("ghghgh", _identity_map("ghghgh"))[0] == "ghghgh"
+    assert apart.shorten("gGgGgG", _identity_map("gGgGgG"))[0] == "gGG"
+
+
+def test_run_shortener_needed_runs_come_from_words_and_options():
+    shortener = _shortener(["zoooooz", "q"], {"/o/": ["o", "0"], "/q/": ["q", "oo"]})
+    # Five "o"s for the word; an option repeating "o" twice needs four.
+    assert shortener.shorten("o" * 9, _identity_map("o" * 9))[0] == "o" * 5
+    assert shortener._representative("\U0001F4A9") is None
+    # A key none of its options spells is no letter of the text's runs.
+    unspelled = _shortener(["xx"], {"/x/": ["ks"]})
+    assert unspelled.shorten("xxxxxx", _identity_map("xxxxxx"))[0] == "xxxxxx"
+    assert unspelled.shorten("kkkkkk", _identity_map("kkkkkk"))[0] == "kkk"
 
 
 def test_phrase_break_retry_is_still_guarded():
@@ -321,6 +378,7 @@ STRATEGY_TEXTS = [
     "sh!t f*ck @ss a$$ " * 40,
     "hell, Lloyd and ass, sam " * 30,
     "coo-on koo oon pimm-mel " * 30,
+    ("f" + "u\u00fc" * 40 + "ck " + "\U0001F4A9" * 9 + " ") * 20,
     "fuckfuckfuck shitshit " * 30,
 ]
 

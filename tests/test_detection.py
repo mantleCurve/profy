@@ -226,6 +226,69 @@ def test_a_match_running_into_the_next_word_is_retried_before_any_separator(engl
         assert english.check(text).clean == clean, text
 
 
+@pytest.mark.parametrize("separator", SEPARATORS)
+def test_a_profanity_joined_to_the_next_word_does_not_bleed_into_it(english, separator):
+    # "hell-Lloyd" was masked "*******oyd": the repeated "l" ran through the
+    # separator into "Lloyd".
+    for word, other in [("hell", "Lloyd"), ("Hell", "llama"), ("ass", "Sasha"), ("damn", "nancy")]:
+        text = f"{word}{separator}{other}"
+        assert english.check(text).clean == "*" * len(word) + separator + other, text
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
+        ("shit-tom", "****-tom"),  # "shitt" would read "shit-t" first
+        ("shit_tom", "****_tom"),
+        ("sh1t-tom", "****-tom"),
+        ("fuck-kim", "****-kim"),
+        ("hell.Lloyd", "****.Lloyd"),
+        ("hell--Lloyd", "****--Lloyd"),
+        ("say hell-Lloyd now", "say ****-Lloyd now"),
+        # A leading "*" stands for any letter, so with the vowel left out it is
+        # no evidence: "*Ll" is not "hll".
+        ("*Lloyd", "*Lloyd"),
+        ("x *Lloyd", "x *Lloyd"),
+        ("hell *Lloyd", "**** *Lloyd"),
+        ("*ll", "*ll"),
+    ],
+)
+def test_separator_joined_words_stay_apart(english, text, clean):
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "f-u-c-k", "f_u_c_k", "s-h-i-t", "sh-it", "sh_it", "a*s*s", "a-ss", "as-s", "fu-ck", "f--ck", "f-ck",
+        "f*ck", "f**k", "*ss", "*hit", "h*ll", "d*mn", "$h!t", "$h*t", "sh1t", "fck", "sht", "dmn", "hll", "$ht",
+        "5ht", "fu-cking", "f-u-c-kyou", "fu-ckhead", "a*s*swad", "shitt-ed", "coo-on", "f*-uck", "f-uuck!ng",
+    ],
+)
+def test_deliberate_obfuscation_inside_a_word_is_still_caught(english, text):
+    assert english.check(text).clean == "*" * len(text), text
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
+        # Symbols inside the obfuscated word mark it as one word.
+        ("sh-itzilla", "******illa"),
+        ("fu-ckzilla", "*****zilla"),
+        ("f-u-c-ks", "*******s"),
+        # So does a separator inside one dictionary word, with its letter
+        # repeated around it ("cockblocker", "shitspitter", "rapist").
+        ("cock*kblocker", "******blocker"),
+        ("shit/tspitter", "*************"),
+        ("rapis(st", "ra*****t"),
+        # Symbols standing for letters are no separator ("lusting").
+        ("lust**ge", "*******e"),
+    ],
+)
+def test_obfuscated_words_running_into_more_letters_keep_their_mask(english, text, clean):
+    assert english.check(text).clean == clean
+
+
 @pytest.mark.parametrize(
     "text, clean",
     [

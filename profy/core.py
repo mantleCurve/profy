@@ -11,7 +11,7 @@ from math import lcm
 import re
 from types import MappingProxyType
 import unicodedata
-from typing import Callable, Iterable, Mapping, NamedTuple, Optional, Union
+from typing import Callable, Container, Iterable, Mapping, NamedTuple, Optional, Union
 
 
 class Severity(str, Enum):
@@ -193,6 +193,7 @@ class ProfanityFilter:
             words = _RunIndex(working, r"\w+")
             hex_runs = _RunIndex(working, r"[0-9a-fA-F-]+")
             hex_verdicts: dict[tuple[int, int], bool] = {}
+            whole_block_tokens: dict[tuple[int, int, str], bool] = {}
             taken = bytearray(len(working))
             accepted: list[tuple[int, int]] = []
             pending: list[tuple[int, int, str, bool, bool]] = []
@@ -206,6 +207,14 @@ class ProfanityFilter:
                     word_end - word_start <= dictionary.longest_false_positive
                     and working[word_start:word_end].lower() in dictionary.false_positives
                 )
+
+            def is_whole_block_token(token: tuple[int, int], matched_text: str) -> bool:
+                # Each token is compared once per distinct match text and pass:
+                # "12" * n with block=["12"] has n matches in one token.
+                key = (token[0], token[1], matched_text.lower())
+                if key not in whole_block_tokens:
+                    whole_block_tokens[key] = _repeats(working[token[0] : token[1]].strip("-"), matched_text)
+                return whole_block_tokens[key]
 
             def accept(start: int, end: int, base: str) -> None:
                 taken[start:end] = b"\x01" * (end - start)
@@ -250,6 +259,33 @@ class ProfanityFilter:
                             continue
                         end = retry.end()
                         matched_text = retry.group(0)
+                    else:
+                        # Through symbols into the first letters of a joined word
+                        # ("hell-Ll|oyd"): the profanity before the symbols is
+                        # retried alone, and when only another entry spells the
+                        # word before them ("shit-t|om" read as "shitt"), that
+                        # entry gets it.
+                        cut = _joined_word_cut(
+                            expression, matched_text, working, start, end, dictionary.words, dictionary.longest_word
+                        )
+                        if cut is not None:
+                            retry = expression.match(working, start, start + cut)
+                            if retry is not None and not _is_spanning_word_boundary(retry.group(0), working, start):
+                                end = retry.end()
+                                matched_text = retry.group(0)
+                            elif matched_text[:cut].lower() in dictionary.words:
+                                continue
+
+                    # A match that only exists by leaving the vowel out must spell
+                    # every consonant ("fck", "f--ck", "$ht"); a character any of
+                    # the word's letters accepts spells none ("*Ll|oyd" as "hll").
+                    elided = dictionary.elided.get(base)
+                    if (
+                        elided is not None
+                        and not _spells(matched_text, *elided)
+                        and not dictionary.unelided(base).fullmatch(working, start, end)
+                    ):
+                        continue
 
                     # A zero-length match can never be masked and would keep the
                     # scan loop alive forever, so it is never accepted. Masked
@@ -261,9 +297,7 @@ class ProfanityFilter:
                         hex_verdicts[token] = _is_hex_token(working[token[0] : token[1]])
                     # An explicit block word that is the whole token, alone or
                     # repeated, is masked anyway ("deadbeef1", "12345678", "1212|1212").
-                    if hex_verdicts[token] and not (
-                        base in dictionary.blocked and _repeats(working[token[0] : token[1]].strip("-"), matched_text)
-                    ):
+                    if hex_verdicts[token] and not (base in dictionary.blocked and is_whole_block_token(token, matched_text)):
                         continue
 
                     # For the Scunthorpe-style substring guard we use the
@@ -427,7 +461,9 @@ class _Dictionary:
         self.languages = list(languages)
         # Parts that make a word a compound of profanities ("hell|fuck"), and how
         # far around a match the substring guard needs to look.
-        self.compound_parts = frozenset(word.lower() for word in profanities if len(word) >= 3)
+        self.words = frozenset(word.lower() for word in profanities)
+        self.longest_word = max([0] + [len(word) for word in self.words])
+        self.compound_parts = frozenset(word for word in self.words if len(word) >= 3)
         self.context_window = max([len(part) for part in self.compound_parts] + [_LONGEST_SUFFIX + 1])
         self.longest_false_positive = max([0] + [len(word) for word in self.false_positives])
         # Stop classes of the generated expressions (see _compile_profanity),
@@ -443,6 +479,16 @@ class _Dictionary:
             # words only lengthen the runs of their own characters (a block word
             # "x" * 300 must not keep "u" runs too long to match "fuu...ck").
             ordered = _ordered_substitutions(substitutions)
+            # Words whose vowel may be left out: how many positions besides the
+            # vowel they have ("ck" in German "sack" is one), the characters
+            # that spell one of their letters, and their expression without
+            # that option.
+            self.elided: dict[str, tuple[int, frozenset]] = {}
+            for word in profanities:
+                if _is_elidable(word):
+                    tokens = _tokenize(word, ordered)
+                    self.elided[word] = (sum(1 for token in tokens if not token.optional), _spelling_characters(tokens))
+            self._compile_arguments = (ordered, tuple(separators))
             self.runs = _RunShortener(
                 {word: _tokenize(word, ordered) for word in profanities},
                 separators,
@@ -517,6 +563,10 @@ class _Dictionary:
             blocked=block,
             bundled=bundled,
         )
+
+    def unelided(self, word: str) -> re.Pattern[str]:
+        """The expression of an elidable ``word`` with its vowel required."""
+        return _compile_profanity(word, *self._compile_arguments, False)[0]
 
     def severity_for(self, word: str) -> Severity:
         return self.severity_map.get(word.lower(), Severity.HIGH)
@@ -820,8 +870,10 @@ def _compile_profanity(
     profanity: str,
     ordered: tuple[tuple[str, tuple[str, ...]], ...],
     separators: tuple[str, ...],
+    elide: bool = True,
 ) -> tuple[re.Pattern[str], re.Pattern[str]]:
-    """The expression for one profanity and its *stop* class.
+    """The expression for one profanity and its *stop* class (``elide``: see
+    ``_tokenize``).
 
     The stop class matches every character that no part of the expression can
     consume or test positively: all token classes, multi-character options and
@@ -832,7 +884,7 @@ def _compile_profanity(
     is the first stop character at or after ``p``. The confirming passes rely
     on this to rescan only where masking changed the text.
     """
-    tokens = _tokenize(profanity, ordered)
+    tokens = _tokenize(profanity, ordered, elide)
     readable: set[str] = set(separators)
     for token in tokens:
         readable.update(token.chars)
@@ -841,6 +893,18 @@ def _compile_profanity(
             readable.add(token.literal)
     stop = re.compile(r"[^\s" + "".join(_class_members(readable)) + "]", re.IGNORECASE | re.UNICODE)
     return re.compile(_tokens_expression(list(tokens), separators), re.IGNORECASE | re.UNICODE), stop
+
+
+def _is_elidable(profanity: str) -> bool:
+    """Whether the single interior vowel of a word may be left out ("fck")."""
+    lowered = profanity.lower()
+    vowel_positions = [index for index, character in enumerate(lowered) if character in _VOWEL_KEYS]
+    consonant_letters = sum(1 for character in lowered if character.isalpha() and character not in _VOWEL_KEYS)
+    return (
+        len(vowel_positions) == 1
+        and 0 < vowel_positions[0] < len(lowered) - 1
+        and consonant_letters >= _MIN_CONSONANTS_FOR_ELISION
+    )
 
 
 def _ordered_substitutions(substitutions: Mapping[str, list[str]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -854,18 +918,14 @@ def _ordered_substitutions(substitutions: Mapping[str, list[str]]) -> tuple[tupl
 
 
 @lru_cache(maxsize=16384)
-def _tokenize(profanity: str, ordered: tuple[tuple[str, tuple[str, ...]], ...]) -> tuple[_Token, ...]:
-    """The positions of one profanity: substitution sets, or literal characters."""
-    lowered = profanity.lower()
-    vowel_positions = [index for index, character in enumerate(lowered) if character in _VOWEL_KEYS]
-    consonant_letters = sum(
-        1 for character in lowered if character.isalpha() and character not in _VOWEL_KEYS
-    )
-    elidable = (
-        len(vowel_positions) == 1
-        and 0 < vowel_positions[0] < len(lowered) - 1
-        and consonant_letters >= _MIN_CONSONANTS_FOR_ELISION
-    )
+def _tokenize(
+    profanity: str,
+    ordered: tuple[tuple[str, tuple[str, ...]], ...],
+    elide: bool = True,
+) -> tuple[_Token, ...]:
+    """The positions of one profanity: substitution sets, or literal characters.
+    With ``elide`` the vowel of an elidable word is optional ("fck")."""
+    elidable = elide and _is_elidable(profanity)
     tokens: list[_Token] = []
     i = 0
     while i < len(profanity):
@@ -1427,6 +1487,64 @@ def _is_spanning_word_boundary(matched: str, full_text: str, start: int) -> bool
     return not _has_letter_and_nonletter(parts[:-1])
 
 
+def _joined_word_cut(
+    expression: re.Pattern[str],
+    matched: str,
+    text: str,
+    start: int,
+    end: int,
+    words: Container[str],
+    longest: int,
+) -> Optional[int]:
+    """Where the plain word ends in a match that runs from it through symbols
+    into the first letters of the next word ("hell|-Ll|oyd", "ass|-S|asha"),
+    or None.
+
+    Symbols inside the obfuscated word itself ("fu-ck|head", "a*s*s|wad",
+    "f-u-c-k|you") are no word boundary, and neither is an inflection after the
+    match ("fu-ck|ing") nor a separator inside one dictionary word, often with
+    its letter repeated around it ("cock*k|blocker", "ra|pis(s|t"). Symbols
+    that stand for letters are no separator either: the profanity must match
+    without them ("lust**g|e" is "lusting", "hell-Ll" still "hellLl").
+    """
+    if end >= len(text) or not _LETTER.match(text, end):
+        return None
+    joined = _JOINED_WORDS.fullmatch(matched)
+    if (
+        joined is None
+        or _WORD_HEAD.match(text, end).group(0).lower() in _INFLECTION_SUFFIXES
+        or not expression.fullmatch(joined.group(1) + joined.group(3))
+    ):
+        return None
+    # The words on both sides, as far as a dictionary word can reach.
+    before = _PLAIN_TAIL.search(text, max(0, start + joined.end(1) - longest), start + joined.end(1))
+    after = _LETTERS_HEAD.match(text, start + joined.start(3), start + joined.start(3) + longest + 1)
+    left, right = before.group(0).lower(), after.group(0).lower()
+    if left + right in words or (left[-1:] == right[:1] and left + right[1:] in words):
+        return None
+    return joined.end(1)
+
+
+def _spelling_characters(tokens: Iterable[_Token]) -> frozenset:
+    """Case-folded characters that stand for some letter of a word but not for
+    all of them ("$" in "shit", not "*")."""
+    classes = [frozenset(character.lower() for character in token.chars) for token in tokens if token.chars]
+    return frozenset().union(*classes) - frozenset.intersection(*classes) if classes else frozenset()
+
+
+def _spells(text: str, consonants: int, spelling: frozenset) -> bool:
+    """Whether ``text`` has at least ``consonants`` letters or spelling characters."""
+    if len(text) - len(_LETTER.sub("", text)) >= consonants:
+        return True
+    count = 0
+    for character in text:
+        if character.isalpha() or character.lower() in spelling:
+            count += 1
+            if count == consonants:
+                return True
+    return False
+
+
 def _retry_before_word_gap(
     expression: re.Pattern[str],
     text: str,
@@ -1436,10 +1554,13 @@ def _retry_before_word_gap(
     """The longest match of ``expression`` at ``start`` that stops before one of
     the gaps between words in ``matched`` and does not span a word boundary
     itself, or None."""
-    for gap in reversed(list(_WORD_GAP.finditer(matched))):
+    # Each maximal run of non-word characters is scanned once; a gap is one
+    # that holds whitespace.
+    gaps = [gap for gap in _NON_WORD_RUN.finditer(matched) if _SPACE.search(gap.group(0))]
+    for gap in reversed(gaps):
         # Before the gap's symbols first ("hell|! Ll"), then at each space in
         # it, last first ("fu**| - k").
-        spaces = reversed([gap.start() + space.start() for space in re.finditer(r"\s+", gap.group(0))])
+        spaces = reversed([gap.start() + space.start() for space in _SPACES.finditer(gap.group(0))])
         for cut in dict.fromkeys([gap.start(), *spaces]):
             retry = expression.match(text, start, start + cut)
             if retry is not None and not _is_spanning_word_boundary(retry.group(0), text, start):
@@ -1448,8 +1569,17 @@ def _retry_before_word_gap(
 
 
 _PHRASE_BREAK = re.compile(r"[,.;:?!]\s|\s[,.;:?!]")
-# Whitespace between words with the symbols around it (", ", " - ", " / ").
-_WORD_GAP = re.compile(r"[^\w\s]*(?:\s+[^\w\s]*)+")
+# A gap between words is a maximal run of non-word characters holding
+# whitespace (", ", " - ", " / ").
+_NON_WORD_RUN = re.compile(r"\W+")
+_LETTER = re.compile(r"[^\W\d_]")
+# A plain word (letters and digits), symbols (or "_"), then letters: "hell-Ll",
+# "sh1t-t", "hell_Ll".
+_JOINED_WORDS = re.compile(r"([^\W_]+)((?:[^\w\s]|_)+)([^\W\d_]+)")
+_PLAIN_TAIL = re.compile(r"[^\W_]+\Z")
+_LETTERS_HEAD = re.compile(r"[^\W\d_]+")
+_SPACE = re.compile(r"\s")
+_SPACES = re.compile(r"\s+")
 # Inflectional endings (plural, past, participle, comparative, superlative,
 # adverb) including the y -> i spellings ("shittier", "crappiest"), plus "-y"
 # and "-iness" adjective/noun forms.

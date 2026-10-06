@@ -1,5 +1,41 @@
 # Profy Changes Log
 
+## 2026-10-06 (fix/codex-review-hardening, Codex review pass 6)
+- P1 word-gap retry was quadratic: `_WORD_GAP` re-ran from every position of
+  a long symbol run ("h e l" + "!£" * 8000: 3.2s, x10 per 4x). Gaps are now
+  the maximal `\W+` runs holding whitespace (`_NON_WORD_RUN`), scanned once:
+  0.58s, x4. Regression test at 2000 vs 8000 units (old x10.4, limit x8).
+- P1 hex exemption compared the whole token per match: verdicts are cached per
+  (token span, lowered match) within a pass (`is_whole_block_token`).
+  block=["12"] alone on "12" * 64000: 2.46s -> 0.24s; test at 32k vs 128k
+  chars for "12", "1212", "deadbeef1" (old x10.6-12.1).
+- Per-match audit (each probed at 4k vs 16k chars, all ~x4): word-gap retry
+  (fixed above), hex exemption (fixed above), hex verdicts (cached per token),
+  `_is_spanning_word_boundary` and its retry (O(match), bounded gap count),
+  chain resolution (`_resolve_chains`, linear support counting), compound and
+  Scunthorpe guards (context cut to the window), false positives (length
+  check before slicing), `_modifies_previous` (each selector run walked once),
+  `_original_span`/claims (O(match)), the new joined-word cut (one anchored
+  regex, side words bounded by the longest entry) and elision check (C-speed
+  letter count, early exit).
+- Joined words ("hell-Lloyd" -> "*******oyd", main too): a match shaped plain
+  word + symbols + letters that ends inside the next word, not on an
+  inflection, is retried on the plain word (`_joined_word_cut`); if only
+  another entry spells it ("shit-t|om" as "shitt"), the candidate is dropped.
+  Not when the symbols stand for letters (the profanity must match without
+  them: "lust**g|e"), nor when both sides form a dictionary word, with or
+  without the letter repeated around the separator ("cock*k|blocker").
+- Elision ("*Lloyd" -> "***oyd", main too): a match that only exists without
+  the vowel (checked against the expression compiled without the elision
+  option) needs one letter or specific substitute per non-vowel position
+  (`_spells`, `_spelling_characters`; "*" is accepted by every letter of
+  "hell", "$" only by "s"; German "ck" is one position).
+- Differential vs pass 5 (r6), all corpora x 4 languages: native corpora 0
+  gained; lost only 8 (German, "d**el"-style consonant + two "*" read as an
+  unrelated elided word); cross-language runs lose 601 such coincidental
+  short-word hits. Native masks mostly grow to the whole word ("k*ck").
+  Windowed/compacted vs full scan: 0 diffs. Dictionary scan: 845, identical.
+
 ## 2026-10-06 (fix/codex-review-hardening, Codex review pass 5)
 - P2 cross-word retry at any separator: a candidate rejected for running into
   the next word is re-matched before each gap between words in it, last gap

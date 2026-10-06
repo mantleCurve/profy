@@ -147,6 +147,9 @@ SCALING_SHAPES = {
     "fuck ": lambda n: "fuck " * n,
     "a55 ": lambda n: "a55 " * n,
     "uuid": lambda n: "123e4567-e89b-12d3-a456-42661417b00b " * (n // 12),
+    "word gap repeated": lambda n: "h e l! " * (n // 2),
+    "joined words": lambda n: "hell-Lloyd " * (n // 4),
+    "elided": lambda n: "*ll fck " * (n // 3),
 }
 
 
@@ -169,6 +172,43 @@ def test_scanning_scales_linearly_with_long_tokens(english, shape):
     large = _best_of_two(english, make(2000))
     assert large < 5.0, (shape, large)
     assert large / max(small, 0.02) < 9, (shape, small, large)
+
+
+# Quadratic shapes whose linear part dominates at small sizes: measured at
+# sizes where the old behaviour took 10-12x the time for 4x the input (linear
+# is ~4x).
+QUADRATIC_LIMIT = 8
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda n: "h e l" + "!\u00a3" * n + "x", id="symbols"),
+        pytest.param(lambda n: "h\te\u3000l" + "!\u00a3" * n + "x", id="mixed-whitespace"),
+        pytest.param(lambda n: "h e l-" + "!\u00a3" * n + "x", id="separator"),
+    ],
+)
+def test_rejected_cross_word_matches_retry_in_linear_time(english, make):
+    # A rejected cross-word match with a long run of symbols its last letter
+    # accepts: every retry rescanned that run ("h e l" + "!\u00a3" * 8000 ~3.2s).
+    small = _best_of_two(english, make(2000))
+    large = _best_of_two(english, make(8000))
+    assert english.check(make(8000)).is_clean
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+
+
+@pytest.mark.parametrize("word", ["12", "1212", "deadbeef1"])
+def test_repeated_hex_like_block_entries_scale_linearly(word):
+    # Every match compared the whole hex-like token with the block word again:
+    # block=["12"] on "12" * 64000 took ~2.6s, 12x the time of a quarter of it.
+    data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
+    alone = ProfanityFilter(allow=data["profanities"], block=[word])
+    small = _best_of_two(alone, word * (32000 // len(word)))
+    large = _best_of_two(alone, word * (128000 // len(word)))
+    assert alone.check(word * 100).clean == "*" * (100 * len(word))
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
 
 
 def test_match_dense_text_scales_linearly():

@@ -24,11 +24,45 @@ def _within(seconds, function, *args):
     return outcome["value"]
 
 
+class _Counted:
+    """A compiled pattern that counts the matches it finds, so a test can
+    show that the expression it adds was actually scanned and matched."""
+
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self.found = 0
+
+    def finditer(self, *args):
+        for found in self.pattern.finditer(*args):
+            self.found += 1
+            yield found
+
+    def _count(self, found):
+        self.found += found is not None
+        return found
+
+    def match(self, *args):
+        return self._count(self.pattern.match(*args))
+
+    def fullmatch(self, *args):
+        return self._count(self.pattern.fullmatch(*args))
+
+    def search(self, *args):
+        return self._count(self.pattern.search(*args))
+
+
 def _with_extra_expressions(shield, *extra):
+    """``shield`` with ``extra`` (entry, pattern) expressions scanned first."""
     dictionary = copy.copy(shield.dictionary)
-    dictionary.sorted_expressions = tuple(extra) + dictionary.sorted_expressions
+    shield.extra = [(base, _Counted(pattern)) for base, pattern in extra]
+    dictionary.sorted_expressions = tuple(shield.extra) + dictionary.sorted_expressions
     shield.dictionary = dictionary
     return shield
+
+
+def _scanned(shield):
+    # Every expression the test added matched something.
+    assert all(pattern.found for _, pattern in shield.extra), [(base, pattern.found) for base, pattern in shield.extra]
 
 
 def test_a_later_match_reports_only_what_is_left_of_a_shared_character():
@@ -45,11 +79,13 @@ def test_a_later_match_reports_only_what_is_left_of_a_shared_character():
     result = _within(30, shield.check, "!\u00e4#cd")
     assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-x", 0, 2), ("zz-y", 2, 3)]
     assert result.clean == "*****"
+    _scanned(shield)
     shield = _with_extra_expressions(
         ProfanityFilter(languages="german", block=["zz-shared"]), ("zz-x", re.compile("!a")), ("zz-y", re.compile("e"))
     )
     result = _within(30, shield.check, "!\u00e4")
     assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-x", 0, 2)]
+    _scanned(shield)
 
 
 def test_scan_loop_never_accepts_zero_length_matches():
@@ -57,6 +93,7 @@ def test_scan_loop_never_accepts_zero_length_matches():
     result = _within(30, shield.check, "! shit !")
     assert result.clean == "! **** !"
     assert all(match.length for match in result.matches)
+    _scanned(shield)
 
 
 def test_scan_loop_ignores_matches_over_already_masked_text():
@@ -66,6 +103,7 @@ def test_scan_loop_ignores_matches_over_already_masked_text():
     result = _within(30, shield.check, "shit")
     assert result.clean == "****"
     assert [match.base for match in result.matches] == ["shit"]
+    _scanned(shield)
 
 
 def test_dictionary_normalize_without_a_span_map():
@@ -284,6 +322,7 @@ def test_matches_never_share_original_characters():
     )
     result = _within(30, shield.check, "!\u00e4#")
     assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-a", 0, 2), ("zz-e", 2, 1)]
+    _scanned(shield)
     assert result.clean == "***"
 
 
@@ -356,6 +395,7 @@ def test_phrase_break_retry_is_still_guarded():
     shield = _with_extra_expressions(ProfanityFilter(block=["zz-retry"]), ("zz-ab", re.compile("ab cd, ef|ab cd")))
     result = _within(30, shield.check, "xab cd, efx")
     assert result.is_clean
+    _scanned(shield)
 
 
 def _candidate(start, end, base, needs=((False, False),), order=0, reported=True):
@@ -507,10 +547,23 @@ def test_confirming_pass_strategies_are_equivalent(monkeypatch, languages):
     full.dictionary = dictionary
     expected = [_result_key(full.check(text)) for text in STRATEGY_TEXTS]
     shield = ProfanityFilter(languages=languages)
+    # Every confirming pass's strategy, to show each spacing chose the one it
+    # is meant to test.
+    modes = []
+    original = core._CandidateFinder.__init__
+
+    def recording(self, *args):
+        original(self, *args)
+        modes.append(self.mode)
+
+    monkeypatch.setattr(core._CandidateFinder, "__init__", recording)
     monkeypatch.setattr(core, "_SHORTCUT_MINIMUM", 0)
-    for spacing in (0, 10**12, core._WINDOW_SPACING):
+    for spacing, mode in ((0, "windowed"), (10**12, "compacted"), (core._WINDOW_SPACING, None)):
         monkeypatch.setattr(core, "_WINDOW_SPACING", spacing)
+        modes.clear()
         assert [_result_key(shield.check(text)) for text in STRATEGY_TEXTS] == expected, spacing
+        # The default spacing picks per text; the others force one strategy.
+        assert set(modes) - {"full"} and (mode is None or set(modes) <= {mode, "full"}), (spacing, set(modes))
 
 
 def test_windowed_rescan_falls_back_for_empty_matches(monkeypatch):
@@ -522,6 +575,7 @@ def test_windowed_rescan_falls_back_for_empty_matches(monkeypatch):
     text = "ab\x01\x01xx"
     expected = [(match.start(), match.end(), match.group(0)) for match in loose.finditer(text)]
     finder = core._CandidateFinder(text, [(2, 4)], {id(loose): re.compile("[^x]")})
+    assert finder.mode == "windowed"
     assert finder.candidates(loose, [(0, 0, "")]) == expected
     assert finder.candidates(loose, []) == expected
 
@@ -571,6 +625,7 @@ def test_an_empty_retry_is_never_selected():
     shield = _with_extra_expressions(ProfanityFilter(block=["zz-empty-retry"]), ("zz-ab", re.compile("(?:ab cd)?")))
     result = _within(30, shield.check, "xab cdx shit")
     assert result.clean == "xab cdx ****"
+    _scanned(shield)
 
 
 def test_a_shortened_candidate_is_still_checked_for_hex_tokens():
@@ -578,3 +633,44 @@ def test_a_shortened_candidate_is_still_checked_for_hex_tokens():
     # is a hex-like identifier, which the hex/UUID guard protects.
     shield = _with_extra_expressions(ProfanityFilter(block=["zz-hx"]), ("zz-hx", re.compile(r"12345678(?: x)?")))
     assert _within(30, shield.check, "12345678 xy").is_clean
+    _scanned(shield)
+
+
+@pytest.mark.parametrize(
+    "word, options",
+    [
+        ("abcdefghijklmnopqrstuvwxyz", {}),
+        ("zip", {}),
+        ("kiss", {}),
+        ("stra\u00dfe", {}),
+        ("\u00e5sa", {}),
+        ("\u0131diot", {}),
+        ("\u0130zmir", {}),
+        ("\u01c6ep", {}),
+        ("\u03c3o\u03c6o\u03c2", {}),
+        ("zip", {"all_languages": True}),
+    ],
+)
+def test_block_precheck_never_skips_a_case_insensitive_match(word, options):
+    # The precheck skipped "z\u0130p" for block=["zip"]: "\u0130".lower() is two
+    # characters, yet re.IGNORECASE matches it with "i". For every character
+    # of the word and every code point below 0x3000 that re.IGNORECASE matches
+    # with it, the entry must not be skipped.
+    shield = ProfanityFilter(block=[word], **options)
+    ((expressions, _),) = shield.blocks.entries
+    # The stored entry, as lowercased by _fold ("ZIP" is "zip"; "\u0130" stays).
+    entry = shield.blocks.profanities[0]
+    for index, character in enumerate(entry):
+        for point in range(0x3000):
+            other = chr(point)
+            if other != character and re.fullmatch(re.escape(character), other, re.IGNORECASE):
+                text = entry[:index] + other + entry[index + 1 :]
+                alphabet = "".join(set(shield.blocks.normalize(text)))
+                assert any(core._may_match(shield.blocks.info(base, expression), alphabet) for base, expression in expressions), (
+                    entry,
+                    other,
+                )
+    assert shield.check(word).clean == "*" * len(word)
+    if word == "zip":
+        assert shield.check("z\u0130p").clean == "***" and shield.check("z-\u0130-p").clean == "*****"
+

@@ -1,5 +1,85 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 18)
+- [P2] the block-entry precheck skipped valid matches: block=["zip"] left
+  "zİp" and "z-İ-p" unmasked (main "***", "*****"). Its letter sets came from
+  str.lower/upper/casefold, which never pair "i" with "İ" although
+  re.IGNORECASE does. Each letter that is not optional now gets one pattern
+  (`_first_character`) built from the same pieces as the expression (its
+  class, the first character of each longer option, its literal) with the
+  same flags, and `_may_match` searches the text's distinct characters with
+  it, so the precheck decides exactly as the expression would. Property
+  test: for 10 entries ("zip", "kiss", "straße", "ıdiot", "İzmir", "ǆep",
+  "σoφoς", ...) every code point below 0x3000 that re.IGNORECASE matches
+  with one of the entry's characters, substituted for it, is never skipped.
+- Found by that test (main and every earlier round too): block and allow
+  entries with a character whose lowercase is longer never matched their own
+  text with either driver. "İzmir".lower() is "i̇zmir" (with a combining
+  dot), so block=["İzmir"] left "İzmir" and "İZMIR" unmasked. Entries,
+  occurrences and literal patterns are now folded by `_fold`, which keeps
+  such characters (no bundled entry contains one; checked).
+- [P3, confirmed] test_split_readings_stay_linear_without_run_shortening
+  [block-only] patched `blocks.runs`, which detection never reads since
+  pass 17 (each entry has its own shortener in `blocks.entries`). It now
+  replaces the bundled shortener and every entry's shortener, and asserts
+  each replacement was called. Audit of every test that patches internals:
+  - added expressions are wrapped in a counting proxy, and the 9 tests
+    using them assert each one matched;
+  - the spacing test records the strategy each finder chose (forced
+    spacings use only their own, the default spacing a non-full one);
+  - the windowed test asserts the windowed mode;
+  - the no-op resync test asserts the clock is never read.
+  Patches whose assertions already exercised them: severity_map,
+  false_positives, and the sync scripts' ROOT/which/run/fetch/urlopen.
+- Timing tests for CI (shared runners, 3.9-3.14):
+  - All of them measure CPU time (time.process_time), including the
+    adversarial worker, the very-long-input test and the cached-helper test.
+  - Scaling tests share `assert_linear`: the minimum of 3 alternating
+    small/large repetitions, a ratio limit of ×8 for a 4× size step, and a
+    20 s hang cap.
+  - Sizes were raised so that linear is about ×4 and the old quadratic
+    ×12 or more: cross-word 16000, hex-block 256000, distinct-hex 24000,
+    glued copies 1280. The dense one-word test uses an 8× step with a ×16
+    limit, because at 4× the pass-3 bug only reached ×7.3.
+  - The adversarial test runs one filter per subprocess, sequentially, with
+    a 10 s CPU budget per input and a 1800 s hard timeout.
+  - Each test fails against the snapshot with the bug it guards, at a 4×
+    step against ×8:
+    - shapes (ca5cfaa8): ×13.5-13.6
+    - cross-word (r6): ×12.0-12.1
+    - hex-block (r6): ×12.1-13.8
+    - distinct-hex (r7): ×12.5
+    - dense one-word (c2004355): ×21.4 at the 8× step, limit ×16
+    - glued (r12): ×13.3-15.2
+    - block-only letter/both-ends (r14): ×14.5/×15.1
+    - split block-only (r14): ×14.9
+    - German s/ß/S/sS (r16): ×15.5-16.4
+    - block-bundled (r16): ×14.3
+    - adversarial (main): 28.9 s for "*" * 22, over the budget.
+  - On r18 every test is at ×4.6 or below. Shapes with no buggy snapshot
+    (the other characters, separators, emoji, digits) are guards only.
+- Suite: 985 passed on 3.14, three runs back to back (227 s, 223 s, 219 s),
+  and on 3.9 alongside them (528 s); 100% line and branch coverage each
+  time, no flakes.
+- Differential vs r18:
+  - 40 corpus runs (masks, matches with severities, scores): 0 differing
+    results, 0 timeouts.
+  - Sweep: identical in all 4 languages.
+  - Dictionary scan: 845 flagged, identical.
+  - Block entries ($S/blockcmp18.py, 4 languages × 150 entries, both
+    drivers, minimum_severity None and high, case variants with
+    İ/ı/K/ſ/ẞ/ς): 816 of 19,200 checks differ, all with a non-ASCII entry
+    or text. 578 mask more, 2 raise severity or score, and 236 only report
+    the block entry instead of the bundled word it used to fall back to,
+    with the same masks, severities and score. None mask less or lower a
+    severity or the score.
+- Performance vs r18 (CPU time, best of 3):
+  - Without block entries: tiny checks, prose, clean and German throughput
+    at parity (within 1-2%, both directions).
+  - With 50/200 block words: build, prose and tiny checks within 1%.
+- core.py 1285 -> 1290 statements, 502 branches (`_variants` replaced by
+  `_first_character`, `_may_match` and `_fold`).
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 17)
 - [P2] one block entry unmasked another's reading ("x-y-z": block=["yz"]
   "x-***", with "xy" "***-z"): the block pipeline selected among all

@@ -17,9 +17,10 @@ import pytest
 from helpers import ROOT
 from profy import ProfanityFilter
 
-# Generous: typical inputs take ~5-40 ms; the regression took seconds to forever.
-PER_INPUT_BUDGET = 2.0
-PROCESS_TIMEOUT = 300
+# CPU seconds. Generous (the slowest input takes ~1s, typical ones 5-40 ms;
+# the regression took 29s to forever), so only a hang or a blow-up fails.
+PER_INPUT_BUDGET = 10.0
+PROCESS_TIMEOUT = 1800
 
 FILTERS = {
     "english": {},
@@ -88,9 +89,9 @@ options, inputs = json.loads(open(sys.argv[1], encoding="utf-8").read())
 shield = ProfanityFilter(**options)
 timings = []
 for text in inputs:
-    started = time.perf_counter()
+    started = time.process_time()
     shield.check(text)
-    timings.append(time.perf_counter() - started)
+    timings.append(time.process_time() - started)
 print(json.dumps(timings))
 """
 
@@ -102,30 +103,19 @@ def test_inputs_cover_every_bundled_character():
     assert "sch" in MULTI_OPTIONS
 
 
-def test_adversarial_inputs_finish_quickly_in_every_language(tmp_path):
-    processes = {}
-    for name, options in FILTERS.items():
-        payload = tmp_path / f"{name}.json"
-        payload.write_text(json.dumps([options, INPUTS]), encoding="utf-8")
-        # All interpreters run concurrently; each gets its input from a file.
-        processes[name] = subprocess.Popen(
-            [sys.executable, "-c", SCRIPT, str(payload)],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    try:
-        outputs = {name: process.communicate(timeout=PROCESS_TIMEOUT) for name, process in processes.items()}
-    finally:
-        for process in processes.values():
-            process.kill()
-
-    for name, (stdout, stderr) in outputs.items():
-        assert processes[name].returncode == 0, stderr
-        timings = json.loads(stdout)
-        slow = [(repr(text[:12]), len(text), round(seconds, 3)) for text, seconds in zip(INPUTS, timings) if seconds > PER_INPUT_BUDGET]
-        assert not slow, f"{name}: {slow}"
+@pytest.mark.parametrize("name", list(FILTERS))
+def test_adversarial_inputs_finish_quickly_in_every_language(tmp_path, name):
+    # One interpreter per filter, one at a time, each timing the CPU its
+    # checks use (a hang fails through the process timeout).
+    payload = tmp_path / f"{name}.json"
+    payload.write_text(json.dumps([FILTERS[name], INPUTS]), encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, "-c", SCRIPT, str(payload)], cwd=ROOT, capture_output=True, text=True, timeout=PROCESS_TIMEOUT
+    )
+    assert completed.returncode == 0, completed.stderr
+    timings = json.loads(completed.stdout)
+    slow = [(repr(text[:12]), len(text), round(seconds, 3)) for text, seconds in zip(INPUTS, timings) if seconds > PER_INPUT_BUDGET]
+    assert not slow, f"{name}: {slow}"
 
 
 @pytest.mark.parametrize("length", [18, 22, 24, 64])
@@ -154,13 +144,32 @@ SCALING_SHAPES = {
 }
 
 
-def _best_of_two(shield, text):
-    timings = []
-    for _ in range(2):
-        started = time.perf_counter()
-        shield.check(text)
-        timings.append(time.perf_counter() - started)
-    return min(timings)
+# Scaling checks time a small and a 4x larger input: linear work takes about
+# 4x the time, quadratic about 16x. Each is timed REPEATS times, alternating,
+# and the least CPU time counts, so a busy machine only slows both alike.
+SCALING_LIMIT = 8
+REPEATS = 3
+# Times below this are too short to compare; the ratio uses it instead.
+FLOOR = 0.02
+# CPU seconds: hang protection only (the slowest large input takes ~1.6s).
+HANG_LIMIT = 20.0
+
+
+def _cpu(shield, text):
+    started = time.process_time()
+    shield.check(text)
+    return time.process_time() - started
+
+
+def assert_linear(shield, small_text, large_text, step=4):
+    # ``large_text`` is ``step`` times ``small_text``: linear work takes about
+    # ``step`` times as long, so the limit is twice that.
+    small = large = float("inf")
+    for _ in range(REPEATS):
+        small = min(small, _cpu(shield, small_text))
+        large = min(large, _cpu(shield, large_text))
+    assert large < HANG_LIMIT, large
+    assert large / max(small, FLOOR) < SCALING_LIMIT * step / 4, (small, large)
 
 
 @pytest.mark.parametrize("shape", list(SCALING_SHAPES))
@@ -169,16 +178,7 @@ def test_scanning_scales_linearly_with_long_tokens(english, shape):
     # match: "a55" * 2000 took ~4.5s and "shit" * 4000 ~33s. Quadrupling the
     # input must now roughly quadruple the time (quadratic would be 16x).
     make = SCALING_SHAPES[shape]
-    small = _best_of_two(english, make(500))
-    large = _best_of_two(english, make(2000))
-    assert large < 5.0, (shape, large)
-    assert large / max(small, 0.02) < 9, (shape, small, large)
-
-
-# Quadratic shapes whose linear part dominates at small sizes: measured at
-# sizes where the old behaviour took 10-12x the time for 4x the input (linear
-# is ~4x).
-QUADRATIC_LIMIT = 8
+    assert_linear(english, make(500), make(2000))
 
 
 @pytest.mark.parametrize(
@@ -192,11 +192,8 @@ QUADRATIC_LIMIT = 8
 def test_rejected_cross_word_matches_retry_in_linear_time(english, make):
     # A rejected cross-word match with a long run of symbols its last letter
     # accepts: every retry rescanned that run ("h e l" + "!\u00a3" * 8000 ~3.2s).
-    small = _best_of_two(english, make(2000))
-    large = _best_of_two(english, make(8000))
     assert english.check(make(8000)).is_clean
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+    assert_linear(english, make(4000), make(16000))
 
 
 @pytest.mark.parametrize("word", ["12", "1212", "deadbeef1"])
@@ -205,11 +202,8 @@ def test_repeated_hex_like_block_entries_scale_linearly(word):
     # block=["12"] on "12" * 64000 took ~2.6s, 12x the time of a quarter of it.
     data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
     alone = ProfanityFilter(allow=data["profanities"], block=[word])
-    small = _best_of_two(alone, word * (32000 // len(word)))
-    large = _best_of_two(alone, word * (128000 // len(word)))
     assert alone.check(word * 100).clean == "*" * (100 * len(word))
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+    assert_linear(alone, word * (64000 // len(word)), word * (256000 // len(word)))
 
 
 def _distinct_hex_matches(n):
@@ -222,15 +216,12 @@ def test_distinct_block_matches_in_one_hex_token_scale_linearly():
     # the whole token again: 12000 such matches took ~2.3s, 10.6x a quarter of them.
     data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
     alone = ProfanityFilter(allow=data["profanities"], block=["ab", "8"])
-    small = _best_of_two(alone, _distinct_hex_matches(3000))
-    large = _best_of_two(alone, _distinct_hex_matches(12000))
     assert alone.check(_distinct_hex_matches(100)).is_clean  # not the block word repeated
     # Only the entry as typed fills a hex-like token; "ab" obfuscated as "ab8"
     # stays protected there.
     assert alone.check("abababab").clean == "*" * 8
     assert alone.check("ab8ab8ab8").is_clean
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+    assert_linear(alone, _distinct_hex_matches(6000), _distinct_hex_matches(24000))
 
 
 def test_match_dense_text_scales_linearly():
@@ -239,19 +230,15 @@ def test_match_dense_text_scales_linearly():
     data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
     single = ProfanityFilter(allow=[word for word in data["profanities"] if word.lower() != "shit"])
     assert list(single.dictionary.expressions) == ["shit"]
-    small = _best_of_two(single, "shit " * 8000)
-    large = _best_of_two(single, "shit " * 32000)
     assert single.check("shit " * 32000).count == 32000
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < 9, (small, large)
+    # The copying cost little per match: only at 8x the input did the old
+    # code take clearly more than linear time (x22; x7 at 4x).
+    assert_linear(single, "shit " * 8000, "shit " * 64000, step=8)
 
 
 def test_match_dense_text_with_the_default_filter(english):
-    small = _best_of_two(english, "shit " * 500)
-    large = _best_of_two(english, "shit " * 2000)
     assert english.check("shit " * 2000).count == 2000
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < 9, (small, large)
+    assert_linear(english, "shit " * 500, "shit " * 2000)
 
 
 @pytest.mark.parametrize(
@@ -270,11 +257,8 @@ def test_glued_copies_scale_linearly(english, unit):
     # Each copy's reading led to the next copy again from every earlier one,
     # so the same matches were judged over and over: "twat" * 640 took ~1.4s,
     # 13x the time of a quarter of it.
-    small = _best_of_two(english, unit * 160)
-    large = _best_of_two(english, unit * 640)
     assert english.check(unit * 640).clean.count("*") >= len(unit.rstrip(",")) * 640
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+    assert_linear(english, unit * 320, unit * 1280)
 
 
 def _block_only(block):
@@ -298,10 +282,7 @@ def test_block_only_dictionaries_scale_linearly_on_long_runs(block, make):
     # and every split of a long first-letter run re-matched the whole rest:
     # block=["x-z"] on "x" * 8000 + "-z" took ~0.9s, 15x a quarter of it.
     shield = _block_only(block)
-    small = _best_of_two(shield, make(2000))
-    large = _best_of_two(shield, make(8000))
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+    assert_linear(shield, make(2000), make(8000))
 
 
 def test_block_only_letter_runs_are_shortened_and_masked():
@@ -313,9 +294,13 @@ def test_block_only_letter_runs_are_shortened_and_masked():
 
 
 class _KeepRuns:
-    """A run shortener that shortens nothing."""
+    """A run shortener that shortens nothing (and counts that it was used)."""
+
+    def __init__(self):
+        self.calls = 0
 
     def shorten(self, text, span_map):
+        self.calls += 1
         return text, span_map
 
     def retained(self, character):
@@ -333,16 +318,18 @@ def test_split_readings_stay_linear_without_run_shortening(block, make):
     # The splits tried inside a run are bounded by themselves, not by the run
     # shortener: with shortening switched off, "x" * 8000 + "-z" took ~0.9s.
     shield = _block_only(block) if block else ProfanityFilter()
-    for name in ("dictionary", "blocks"):
-        if getattr(shield, name) is not None:
-            dictionary = copy.copy(getattr(shield, name))
-            dictionary.runs = _KeepRuns()
-            setattr(shield, name, dictionary)
-    small = _best_of_two(shield, make(2000))
-    large = _best_of_two(shield, make(8000))
+    keep = _KeepRuns()
+    dictionary = copy.copy(shield.dictionary)
+    dictionary.runs = keep
+    shield.dictionary = dictionary
+    if shield.blocks is not None:
+        # Block entries are detected with their own shorteners.
+        blocks = copy.copy(shield.blocks)
+        blocks.entries = tuple((expressions, keep) for expressions, _ in blocks.entries)
+        shield.blocks = blocks
     assert shield.check(make(8000)).clean.startswith("*" * 100)
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+    assert keep.calls == (1 + len(shield.blocks.entries) if shield.blocks else 1)
+    assert_linear(shield, make(2000), make(8000))
 
 
 @pytest.mark.parametrize(
@@ -359,10 +346,7 @@ def test_split_readings_stay_linear_without_run_shortening(block, make):
 )
 def test_normalization_scales_linearly(language, unit):
     shield = ProfanityFilter(languages=language)
-    small = _best_of_two(shield, unit * (4000 // len(unit)))
-    large = _best_of_two(shield, unit * (16000 // len(unit)))
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+    assert_linear(shield, unit * (4000 // len(unit)), unit * (16000 // len(unit)))
 
 
 def test_block_entries_matching_bundled_text_scale_linearly():
@@ -370,8 +354,5 @@ def test_block_entries_matching_bundled_text_scale_linearly():
     # only "shit" bundled and blocked, "shit " * 8000 took ~0.9s, 3x 4000.
     data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
     shield = ProfanityFilter(allow=[word for word in data["profanities"] if word.lower() != "shit"], block=["shit"])
-    small = _best_of_two(shield, "shit " * 8000)
-    large = _best_of_two(shield, "shit " * 32000)
     assert shield.check("shit " * 100).clean == "**** " * 100
-    assert large < 5.0, large
-    assert large / max(small, 0.02) < 9, (small, large)
+    assert_linear(shield, "shit " * 8000, "shit " * 32000)

@@ -149,11 +149,15 @@ def test_first_sync_exports_only_word_lists(repo, tools, capsys):
 def test_noop_resync_writes_nothing(repo, tools, monkeypatch, capsys):
     sync(repo)
     before = snapshot(repo)
-    monkeypatch.setattr(blasp, "utcnow", lambda: "2030-01-01T00:00:00+00:00")
+    # A later clock must not rewrite anything: the time is not even taken
+    # when nothing changed.
+    clock = []
+    monkeypatch.setattr(blasp, "utcnow", lambda: clock.append(1) or "2030-01-01T00:00:00+00:00")
     capsys.readouterr()
 
     assert sync(repo) == 0
     assert snapshot(repo) == before
+    assert clock == []
     assert "nothing written" in capsys.readouterr().out
     assert ["git", "clone"] not in tools.calls[-6:]
 

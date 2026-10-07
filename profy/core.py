@@ -165,10 +165,10 @@ class ProfanityFilter:
                 # others' expressions, selection or masks.
                 blocks = self.blocks
                 found += self._exact(blocks, original, visible, visible_map)
-                present = _variants(set(normalized))
+                # Each character of the text once (shortening keeps every one).
+                alphabet = "".join(set(normalized))
                 for expressions, runs in blocks.entries:
-                    # An entry whose letters are not all in the text finds nothing.
-                    if any(all(needed & present for needed in blocks.info(base, expression).required) for base, expression in expressions):
+                    if any(_may_match(blocks.info(base, expression), alphabet) for base, expression in expressions):
                         found += self._detect(blocks, original, normalized, normalized_map, expressions, runs, 1, union=True)
         matches, score = self._report(original, found, visible)
         return ShieldResult(original, self._apply_masks(original, matches), tuple(matches), score)
@@ -246,7 +246,7 @@ class ProfanityFilter:
         token_roots: dict[tuple[int, int], tuple[str, int]] = {}
 
         def is_exact(first: int, last: int, base: str) -> bool:
-            occurrence = text[first:last].lower()
+            occurrence = _fold(text[first:last])
             if occurrence != base and " " in base:
                 occurrence = " ".join(occurrence.split())
             if occurrence == base and not (
@@ -255,7 +255,7 @@ class ProfanityFilter:
                 return True
             token = alphanumeric.around(first, last)
             if token not in token_roots:
-                folded = text[token[0] : token[1]].lower()
+                folded = _fold(text[token[0] : token[1]])
                 token_roots[token] = (folded, _root_length(folded))
             return _repeats(*token_roots[token], base)
 
@@ -858,8 +858,8 @@ class _Dictionary:
                     if value not in existing:
                         existing.append(value)
 
-        bundled = list(dict.fromkeys(word for word in profanities if word.lower() not in allow))
-        block = [word for word in dict.fromkeys(block) if word.lower() not in allow]
+        bundled = list(dict.fromkeys(word for word in profanities if _fold(word) not in allow))
+        block = [word for word in dict.fromkeys(block) if _fold(word) not in allow]
         if block:
             # Like Blasp, only words new to the dictionary default to HIGH;
             # blocking an existing word keeps its curated severity. An explicit
@@ -905,7 +905,7 @@ class _Dictionary:
             first_run = last_letter = _class_pattern(())
             if tokens:
                 first_chars, last_chars = (
-                    {character.lower() for character in (token.chars or {token.literal or ""})} - wildcards - {""}
+                    {_fold(character) for character in (token.chars or {token.literal or ""})} - wildcards - {""}
                     for token in (tokens[0], tokens[-1])
                 )
                 first_run = re.compile(_class_pattern(first_chars).pattern + "+", re.IGNORECASE | re.UNICODE)
@@ -919,12 +919,8 @@ class _Dictionary:
                 unelided = _compile_profanity(self._spellings.get(word, word), ordering, self._separators, False, optional)[0]
                 elision = (sum(1 for token in tokens if not token.optional), _spelling_characters(tokens), unelided)
             # Each match holds a character of every letter that is not
-            # optional (used to skip block entries, see ProfanityFilter.check).
-            required = tuple(
-                _variants(token.chars | {option[0] for option in token.multi} | ({token.literal} if token.literal else set()))
-                for token in tokens
-                if not token.optional and self.block_literals
-            )
+            # optional (used to skip block entries, see _may_match).
+            required = tuple(_first_character(token) for token in tokens if not token.optional and self.block_literals)
             info = _ExpressionInfo(first, wildcards, elision, first_run, last_letter, required)
             self._infos[id(expression)] = info
         return info
@@ -1028,14 +1024,14 @@ class _ExpressionInfo(NamedTuple):
     letters and the expression with the vowel required (else None); a run of
     the characters its first letter accepts, and one character its last
     letter accepts, wildcards excluded; and per letter that is not optional
-    the characters (with their case variants) one of which every match holds."""
+    a pattern for the characters it can start with (see _may_match)."""
 
     first: re.Pattern[str]
     wildcards: frozenset
     elision: Optional[tuple[int, frozenset, re.Pattern[str]]]
     first_run: re.Pattern[str]
     last_letter: re.Pattern[str]
-    required: tuple[frozenset, ...] = ()
+    required: tuple[re.Pattern[str], ...] = ()
 
 
 class _RunShortener:
@@ -1595,7 +1591,7 @@ def _compile_literal(profanity: str) -> re.Pattern[str]:
     # words that start or end with a symbol ("c++", "100%"). The literal driver
     # checks the raw text, so a space matches any run of whitespace.
     return re.compile(
-        r"(?<!\w)" + r"\s+".join(re.escape(part) for part in profanity.lower().split(" ")) + r"(?!\w)",
+        r"(?<!\w)" + r"\s+".join(re.escape(part) for part in _fold(profanity).split(" ")) + r"(?!\w)",
         re.IGNORECASE | re.UNICODE,
     )
 
@@ -1914,12 +1910,24 @@ class _CandidateFinder:
         return found
 
 
-def _variants(characters: Iterable[str]) -> frozenset:
-    """``characters`` with the case variants case-insensitive matching treats
-    as equal to them ("s" and the long "ſ")."""
-    return frozenset(
-        variant for character in characters for variant in (character, character.lower(), character.upper(), character.casefold())
-    )
+def _first_character(token: _Token) -> re.Pattern[str]:
+    """The characters ``token`` can start with, as the expression matches
+    them: built from the same pieces (its class, the first character of each
+    longer option, its literal) with the same flags, so case-insensitive
+    matching treats them exactly alike ("i" and "İ", "s" and "ſ")."""
+    pieces = (["[" + "".join(_class_members(token.chars)) + "]"] if token.chars else []) + [
+        re.escape(text[0]) for text in (*token.multi, *([token.literal] if token.literal is not None else []))
+    ]
+    return re.compile("|".join(pieces) or "(?!)", re.IGNORECASE | re.UNICODE)
+
+
+def _may_match(info: "_ExpressionInfo", alphabet: str) -> bool:
+    """Whether the expression of ``info`` can match a text whose distinct
+    characters are ``alphabet``: every match holds a character each letter
+    that is not optional starts with, and these single characters match
+    whatever surrounds them, so looking for them among the distinct
+    characters decides it exactly as the expression would."""
+    return all(pattern.search(alphabet) for pattern in info.required)
 
 
 def _merge_spans(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -2000,7 +2008,7 @@ def _repeats(folded: str, root: int, unit: str) -> bool:
     """Whether ``folded`` (case-folded, with its root length) is ``unit`` once
     or more, case-insensitively, in time linear in ``unit``: the unit must be a
     whole number of roots, fit a whole number of times and start the text."""
-    unit = unit.lower()
+    unit = _fold(unit)
     return bool(unit) and not len(unit) % root and not len(folded) % len(unit) and folded.startswith(unit)
 
 
@@ -2478,6 +2486,13 @@ def _coerce_languages(languages: Union[str, Iterable[str]]) -> list[str]:
     return selected
 
 
+def _fold(text: str) -> str:
+    """``text`` lowercased character by character, keeping a character whose
+    lowercase is longer ("İ" is "i" plus a combining dot), so that a folded
+    entry still matches its own text case-insensitively ("İzmir")."""
+    return "".join(character if len(character.lower()) != 1 else character.lower() for character in text)
+
+
 def _coerce_words(words: Iterable[str], option: str, *, strip_invisible: bool = False) -> frozenset[str]:
     # A bare string is one word, not an iterable of letters. Blank entries are
     # ignored: an empty pattern would match everywhere without consuming text.
@@ -2491,7 +2506,7 @@ def _coerce_words(words: Iterable[str], option: str, *, strip_invisible: bool = 
             # so an entry keeping them ("\u2764\ufe0f") could never match.
             word = "".join(character for character in word if not _is_invisible(character))
         # Whitespace inside an entry is collapsed like the checked text is.
-        word = " ".join(word.split()).lower()
+        word = _fold(" ".join(word.split()))
         if word:
             cleaned.add(word)
     return frozenset(cleaned)

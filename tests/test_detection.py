@@ -877,9 +877,9 @@ def test_empty_and_blank_input(english, text):
 
 def test_very_long_input(english):
     text = "a perfectly ordinary sentence " * 400 + "and then shit"
-    started = time.perf_counter()
+    started = time.process_time()
     result = english.check(text)
-    assert time.perf_counter() - started < 10
+    assert time.process_time() - started < 10
     assert result.count == 1
     assert result.clean.endswith("and then ****")
     assert result.matches[0].position == len(text) - 4

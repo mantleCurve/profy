@@ -782,12 +782,13 @@ def test_expressions_are_sorted_once_longest_first():
 
 def test_repeated_helper_calls_are_fast():
     filter_text("warm up the cache")
-    started = time.perf_counter()
+    started = time.process_time()
     for _ in range(200):
         assert check_text("shit")
         assert clean_text("hello there") == "hello there"
-    # ~1 ms per call once cached (it was ~1.5 s per call before caching).
-    assert time.perf_counter() - started < 10
+    # ~1 ms per call once cached (it was ~1.5 s per call before caching, so
+    # 600 s for these): CPU time, generous, so only losing the cache fails.
+    assert time.process_time() - started < 10
 
 
 def test_helpers_are_thread_safe():

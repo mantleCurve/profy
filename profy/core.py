@@ -295,8 +295,8 @@ class ProfanityFilter:
                         needs = ((bool(guard[1]) and not touches_before, bool(guard[2]) and not touches_after),)
                     if not needs:
                         return
-                if reading.before:
-                    needs = tuple(dict.fromkeys((True, right) for _, right in needs))
+                if reading.before or reading.after:
+                    needs = tuple(dict.fromkeys((left or reading.before, right or reading.after) for left, right in needs))
                 word_start, word_end = words.around(start, end)
                 if (
                     word_end - word_start <= dictionary.longest_false_positive
@@ -452,6 +452,7 @@ class ProfanityFilter:
                 dictionary.longest_match,
                 info.first,
                 info.wildcards,
+                info.last_letter,
             )
             if given is None:
                 return []
@@ -477,24 +478,40 @@ class ProfanityFilter:
                         break
                 ends.extend(given_back(last))
         readings = [_Reading(start, last) for last in ends]
-        # A match starting in a run of its first letter may leave the run's
-        # first letters to a reading before it, at any split point of the run
-        # ("as|sshit", "bitttch|hell", "bitchhh|hhell"). Such a reading only
-        # counts next to one that ends where it starts (see _Reading), so a
-        # double that is the word's own makes no compound ("git|tite").
-        # Matched on the slice, as the start guard refuses starts inside the
-        # run. The run is as long as the working text keeps it: the run
-        # shortener caps it per character (the longest run any word needs,
-        # 8 for hexadecimal digits), so this stays constant work per match.
-        lead = matched[0].lower()
-        if lead not in info.wildcards:
-            for run in range(1, len(matched)):
-                if matched[run].lower() != lead:
-                    break
+        # Likewise at the end: a reading may end inside a deliberate final run
+        # of its last letter (three or more characters, or a substitute among
+        # them: "bitchΗ|ell") when the next reading starts there. Two equal
+        # plain letters are the word's own double ("git|tite").
+        for last in ends:
+            run = 0
+            while run <= min(last - start - 1, _GIVE_BACK_LIMIT) and info.last_letter.match(working, last - 1 - run):
+                run += 1
+            tail = working[last - run : last]
+            if run >= 3 or (run == 2 and not (tail[0].lower() == tail[1].lower() and _ASCII_WORD.fullmatch(tail))):
                 readings.extend(
-                    _Reading(start + run, last, True)
-                    for last in ends
-                    if last > start + run and expression.fullmatch(working[start + run : last])
+                    _Reading(start, last - given, after=True)
+                    for given in range(1, run)
+                    if expression.fullmatch(working[start : last - given])
+                )
+        # A match starting in a run of its first letter (any characters that
+        # letter accepts: "hΗh", "tτt") may leave the run's first letters to a
+        # reading before it ("as|sshit", "bitttch|hell", "bitchhh|hhell",
+        # "bitchΗ|hell"). Such a reading only counts next to one that ends
+        # where it starts (see _Reading), so a double that is the word's own
+        # makes no compound ("git|tite"). A reading before it whose last
+        # letter takes this run reads all of it and gives back at most
+        # _GIVE_BACK_LIMIT characters, and shortening keeps runs no longer
+        # than ``runs.kept``: only splits that close to the run's end are
+        # tried, so the work per match stays bounded whether or not the run
+        # was shortened (block entries' letters may run on). Each is matched
+        # on the slice from the split, as the start guard refuses starts
+        # inside the run.
+        run = info.first_run.match(working, start, end)
+        if run is not None:
+            limit = max(_GIVE_BACK_LIMIT, dictionary.runs.kept(working[start]))
+            for split in range(max(start + 1, run.end() - limit), run.end()):
+                readings.extend(
+                    _Reading(split, last, True) for last in ends if last > split and expression.fullmatch(working[split:last])
                 )
         return readings, follows
 
@@ -742,16 +759,16 @@ class _Dictionary:
             )
             # What a match covers but that spells nothing (see _select).
             self.blank = re.compile(r"[\s" + members + "]+")
-            # Explicit block entries are found as typed before normalization
-            # (see check()), so only the bundled words decide how long a run
-            # stays: a block word "u" * 100 must not keep "u" runs longer than
+            # Every word's letters are runs that can be shortened, but explicit
+            # block entries are found as typed before normalization (see
+            # check()), so only the bundled words decide how long a run stays:
+            # a block word "u" * 100 must not keep "u" runs longer than
             # "fuu...ck" can match.
-            own = {word.lower() for word in bundled}
             self.runs = _RunShortener(
-                [(word, _tokenize(word, ordered)) for word in profanities if word.lower() in own]
-                + [(word, tokens) for word, tokens in variant_tokens if word.lower() in own],
+                [(word, _tokenize(word, ordered)) for word in profanities] + variant_tokens,
                 separators,
                 _longest_needed_run(bundled, substitutions),
+                {word.lower() for word in bundled},
             )
         # Longest first; among equally long words an explicitly blocked one goes
         # first, so it always matches its own text ("*6zy" before "fagz").
@@ -846,6 +863,18 @@ class _Dictionary:
             else:
                 first = _class_pattern(tokens[0].chars | {option[0] for option in tokens[0].multi})
             classes = [frozenset(character.lower() for character in token.chars) for token in tokens if token.literal is None]
+            wildcards = frozenset.intersection(*classes) if classes else frozenset()
+            # The characters a run of the first or the last letter may hold:
+            # every substitute the letter accepts ("hΗh", "t+τt", "5s$"), but
+            # no character every letter accepts.
+            first_run = last_letter = _class_pattern(())
+            if tokens:
+                first_chars, last_chars = (
+                    {character.lower() for character in (token.chars or {token.literal or ""})} - wildcards - {""}
+                    for token in (tokens[0], tokens[-1])
+                )
+                first_run = re.compile(_class_pattern(first_chars).pattern + "+", re.IGNORECASE | re.UNICODE)
+                last_letter = _class_pattern(last_chars)
             elision = None
             if _is_elidable(word):
                 # Positions besides the vowel ("ck" in German "sack" is one),
@@ -853,7 +882,7 @@ class _Dictionary:
                 # vowel required.
                 unelided = _compile_profanity(word, ordering, self._separators, False, optional)[0]
                 elision = (sum(1 for token in tokens if not token.optional), _spelling_characters(tokens), unelided)
-            info = _ExpressionInfo(first, frozenset.intersection(*classes) if classes else frozenset(), elision)
+            info = _ExpressionInfo(first, wildcards, elision, first_run, last_letter)
             self._infos[id(expression)] = info
         return info
 
@@ -937,11 +966,15 @@ class _ExpressionInfo(NamedTuple):
     """Per expression: the characters it can start with; those every letter
     of it accepts ("*"); and for a word whose vowel may be left out, how many
     positions besides the vowel it has, the characters that spell one of its
-    letters and the expression with the vowel required (else None)."""
+    letters and the expression with the vowel required (else None); a run of
+    the characters its first letter accepts, and one character its last
+    letter accepts, wildcards excluded."""
 
     first: re.Pattern[str]
     wildcards: frozenset
     elision: Optional[tuple[int, frozenset, re.Pattern[str]]]
+    first_run: re.Pattern[str]
+    last_letter: re.Pattern[str]
 
 
 class _RunShortener:
@@ -970,12 +1003,19 @@ class _RunShortener:
     (``_HEX_TOKEN_MINIMUM`` for hexadecimal digits) and as many as any word or
     repeated option needs in a row (see ``_longest_needed_run``). For
     characters that also occur as literals the kept length is congruent to
-    the run length modulo every literal run of them ("00" in "b00bs", a block
-    word "**") and the cut starts a multiple of it into the run, so complete
-    occurrences stay complete.
+    the run length modulo every literal run of them ("00" in "b00bs") and the
+    cut starts a multiple of it into the run, so complete occurrences stay
+    complete. Run lengths and literal runs only count for the ``measured``
+    words (default: all); the others only contribute their letters.
     """
 
-    def __init__(self, tokenized: list[tuple[str, tuple[_Token, ...]]], separators: Iterable[str], floor: int) -> None:
+    def __init__(
+        self,
+        tokenized: list[tuple[str, tuple[_Token, ...]]],
+        separators: Iterable[str],
+        floor: int,
+        measured: Optional[Container[str]] = None,
+    ) -> None:
         classes: set[frozenset] = set()
         literals: set[str] = set()
         options: set[str] = set()
@@ -1020,6 +1060,9 @@ class _RunShortener:
         needed: dict[str, int] = {}
         periods: dict[str, int] = {}
         for word, tokens in tokenized:
+            if measured is not None and word.lower() not in measured:
+                # Its letters are runs, but not its run lengths (see above).
+                continue
             repeats = list(_REPEATED.finditer(word.translate(table)))
             for repeat in repeats:
                 needed[repeat.group(1)] = max(needed.get(repeat.group(1), 0), len(repeat.group(0)))
@@ -1060,6 +1103,18 @@ class _RunShortener:
                 limits = (max(self._floor, self._needed.get(representative, 0), period), period)
             self._limits[representative] = limits
         return self._limits[representative]
+
+    def kept(self, character: str) -> int:
+        """The longest run of ``character`` (and the characters interchangeable
+        with it) that shortening leaves, or 0 when its runs are kept whole."""
+        representative = self._representative(character)
+        limits = None if representative is None else self._limits_for(representative)
+        if limits is None:
+            return 0
+        keep, period = limits
+        if _HEX_CHARACTER.match(character):
+            keep = max(keep, _HEX_TOKEN_MINIMUM)
+        return keep + period - 1
 
     def shorten(self, text: str, span_map: list[tuple[int, int]]) -> tuple[str, list[tuple[int, int]]]:
         # Runs are found on a copy where interchangeable characters are equal.
@@ -1516,11 +1571,13 @@ def _chain_needs(guard: tuple, touches_before: bool, touches_after: bool) -> tup
 class _Reading(NamedTuple):
     """A span of the working text one match can be read as, and whether it
     only counts next to a chosen reading (or an earlier pass's match) that
-    ends where it starts: it starts inside a run of one letter."""
+    ends where it starts (``before``) or starts where it ends (``after``): it
+    splits a run of one letter."""
 
     start: int
     end: int
     before: bool = False
+    after: bool = False
 
 
 class _Candidate(NamedTuple):
@@ -1936,15 +1993,17 @@ def _end_before_profanity(
     reach: int,
     first: re.Pattern[str],
     wildcards: Container[str] = frozenset(),
+    last_letter: re.Pattern[str] = re.compile("(?!)"),
 ) -> Optional[tuple[int, Optional[re.Match[str]]]]:
     """How many characters (up to ``_GIVE_BACK_LIMIT``) a match can give back
     to what follows it when more than whitespace does: the same match ending
     that much earlier is a match too, and the given-back characters start
     another match of the same expression ("twaatt|waat", "¢yberfuc¢|yberfuc";
     ``first`` matches the characters such a match can start with), or, within
-    a final run of one letter, a literal profanity that runs to the end of the
-    word or to an inflection ("shitt|its" -> "shit|tits"; not "gitt|ite",
-    where the double is the word's own). Returns that count and the following
+    a final run of the last letter (``last_letter`` matches what it accepts),
+    a literal profanity that runs to the end of the word or to an inflection
+    ("shitt|its" -> "shit|tits"; not "gitt|ite", where the double is the
+    word's own). Returns that count and the following
     match (relative to where it starts, or None), or None. The count is 0 when
     the following match starts right at the end but finditer() would miss it.
 
@@ -1967,9 +2026,10 @@ def _end_before_profanity(
         return (0, follow) if text[end].lower() not in wildcards and not expression.match(text, end) else None
     if text[end - 1].lower() in wildcards:
         return None
-    last = matched[-1].lower()
-    run = 1
-    while run < len(matched) and matched[-run - 1].lower() == last:
+    # The final run of the last letter (any characters it accepts), as far as
+    # anything may be given back.
+    run = 0
+    while run <= min(len(matched) - 1, _GIVE_BACK_LIMIT) and last_letter.match(matched, len(matched) - 1 - run):
         run += 1
     for given in range(1, min(len(matched) - 1, _GIVE_BACK_LIMIT) + 1):
         if text[end - given].lower() in wildcards:

@@ -519,6 +519,44 @@ def test_long_runs_in_ordinary_words_stay_clean(english, text):
 
 
 @pytest.mark.parametrize(
+    "left, right, substitute",
+    [
+        ("bitch", "hell", "\u0397"),  # Greek capital eta
+        ("shit", "twat", "\u03c4"),  # Greek tau
+        ("shit", "twat", "\u03a4"),  # Greek capital tau
+        ("ass", "shit", "5"),
+        ("ass", "shit", "$"),
+        ("ass", "shit", "\u0161"),  # s with caron
+        ("fuck", "kunt", "\u03ba"),  # Greek kappa
+        ("whore", "eatme", "3"),
+        ("whore", "eatme", "\u00e9"),
+    ],
+)
+def test_readings_meet_inside_runs_of_substitutes(english, left, right, substitute):
+    # Runs were told apart by their literal letters, so a run mixing a letter
+    # with its substitutes was no run: "bitchΗhell" came back "*******ell".
+    letter = left[-1]
+    for size in range(2, _retained_run(english, letter) + 4):
+        for run in {letter + substitute * (size - 1), substitute * (size - 1) + letter, ((letter + substitute) * size)[:size]}:
+            text = left[:-1] + run + right[1:]
+            assert english.check(text).clean == "*" * len(text), (text, english.check(text).clean)
+
+
+@pytest.mark.parametrize(
+    "text, clean",
+    [
+        ("assessment", "assessment"),
+        ("cookkook", "cookkook"),
+        ("helloΗass", "hello\u0397***"),  # "hello" stays a word
+        ("shellΗell", "s********"),  # "hell" twice, glued
+        ("pa5sion", "p***ion"),  # "a5s" is an obfuscated "ass"
+    ],
+)
+def test_substitutes_inside_ordinary_words(english, text, clean):
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize(
     "text, options, clean",
     [
         # The end of a word read into the next is no match, even next to

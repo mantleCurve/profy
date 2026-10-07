@@ -6,6 +6,7 @@ shared by several letters and the separators: ``"*" * 22`` took ~29s and
 with a hard timeout, so a regression fails instead of hanging the test run.
 """
 
+import copy
 import json
 import subprocess
 import sys
@@ -272,5 +273,71 @@ def test_glued_copies_scale_linearly(english, unit):
     small = _best_of_two(english, unit * 160)
     large = _best_of_two(english, unit * 640)
     assert english.check(unit * 640).clean.count("*") >= len(unit.rstrip(",")) * 640
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+
+
+def _block_only(block):
+    data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
+    return ProfanityFilter(allow=data["profanities"], block=block)
+
+
+@pytest.mark.parametrize(
+    "block, make",
+    [
+        pytest.param(["x-z"], lambda n: "x" * n + "-z", id="letter"),
+        pytest.param(["x-z"], lambda n: "x" * n + "-" + "z" * n, id="letter-both-ends"),
+        pytest.param(["--x"], lambda n: "-" * n + "x", id="separator"),
+        pytest.param(["\U0001F4A9x"], lambda n: "\U0001F4A9" * n + "x", id="emoji"),
+        pytest.param(["1x"], lambda n: "1" * n + "x", id="digit"),
+        pytest.param(["xy"], lambda n: "xX" * (n // 2) + "y", id="mixed-case"),
+    ],
+)
+def test_block_only_dictionaries_scale_linearly_on_long_runs(block, make):
+    # With only block entries, nothing shortened the runs of their letters
+    # and every split of a long first-letter run re-matched the whole rest:
+    # block=["x-z"] on "x" * 8000 + "-z" took ~0.9s, 15x a quarter of it.
+    shield = _block_only(block)
+    small = _best_of_two(shield, make(2000))
+    large = _best_of_two(shield, make(8000))
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+
+
+def test_block_only_letter_runs_are_shortened_and_masked():
+    # Block entries' letters are runs the shortener knows again (only their
+    # run lengths do not count), so a long run still matches.
+    assert _block_only(["xy"]).check("x" * 80 + "y").clean == "*" * 81
+    assert _block_only(["xy"]).check("xX" * 40 + "y").clean == "*" * 81
+    assert _block_only(["x-z"]).check("x" * 9000 + "-z").clean == "*" * 9002
+
+
+class _KeepRuns:
+    """A run shortener that shortens nothing."""
+
+    def shorten(self, text, span_map):
+        return text, span_map
+
+    def kept(self, character):
+        return 0
+
+
+@pytest.mark.parametrize(
+    "block, make",
+    [
+        pytest.param(["x-z"], lambda n: "x" * n + "-z", id="block-only"),
+        pytest.param([], lambda n: "bitch" + "h" * n + "hell", id="bundled"),
+    ],
+)
+def test_split_readings_stay_linear_without_run_shortening(block, make):
+    # The splits tried inside a run are bounded by themselves, not by the run
+    # shortener: with shortening switched off, "x" * 8000 + "-z" took ~0.9s.
+    shield = _block_only(block) if block else ProfanityFilter()
+    dictionary = copy.copy(shield.dictionary)
+    dictionary.runs = _KeepRuns()
+    shield.dictionary = dictionary
+    small = _best_of_two(shield, make(2000))
+    large = _best_of_two(shield, make(8000))
+    assert shield.check(make(8000)).clean.startswith("*" * 100)
     assert large < 5.0, large
     assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)

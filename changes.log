@@ -1,5 +1,64 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 14)
+- P1 quadratic with a block-only dictionary (d32a146): since pass 11 the run
+  shortener ignored block entries entirely, so with only block entries no
+  run was shortened, and the leading-run split loop matched every suffix of
+  an unbounded first-letter run (block=["x-z"], "x" * 8000 + "-z": 0.88s,
+  x14.7 per x4). Two fixes:
+  * Split work is bounded by itself: splits are tried only within the last
+    max(_GIVE_BACK_LIMIT, runs.kept(character)) characters of the run (a
+    reading before it whose last letter takes the run reads all of it and
+    gives back at most _GIVE_BACK_LIMIT; shortening keeps no longer runs),
+    and each split matches only the slice from the split. With shortening
+    switched off (test double) "x" * 8000 + "-z" is 3ms, x0.1.
+    `_RunShortener.kept()` reports the per-character retained length.
+  * Block entries feed the shortener's letter classes again; only their run
+    lengths and literal periods do not count (`measured` = bundled words).
+    This also restores block-only matching of long runs, lost since pass 11:
+    block=["xy"] masked nothing in "x" * 80 + "y" (r11 masked it; a first
+    letter shared with the next one runs at most 64 characters unshortened).
+- Audit of loops bounded by the shortener (every loop on the candidate path,
+  for unshortened runs): leading-run splits (fixed above), trailing-run scans
+  in `_readings` and `_end_before_profanity` (capped at _GIVE_BACK_LIMIT + 1
+  characters; the latter was an unbounded character loop), give-back (3
+  positions, slices cut to `reach`), follows after a cut (longest_word starts,
+  first hit), word-gap retry (one per gap, gaps bounded by the entry's
+  tokens), cross-word and joined-word guards (O(match) once per reading,
+  windows bounded by the longest entry), `evaluate` (O(match): elision,
+  hex with per-token verdicts, Scunthorpe contexts cut to the window, at
+  most 3 `_chain_needs` calls, false positives length-checked),
+  `splits_a_hit` (only the hits a reading overlaps), block hits (token
+  roots cached), `_select` (linear), finditer first-letter runs (start
+  guard). Scaling tests: block-only letter, letter at both ends, separator,
+  emoji, digit and mixed-case runs (r14: letter x14.5, the others linear as
+  their tokens are literals), and split readings with shortening disabled.
+- P2 runs mixing a letter with its substitutes ("bitchΗhell" with Greek
+  capital eta, "shittτtwat" with tau): runs were found by comparing
+  lowercased characters. They are now runs of the characters the first
+  letter's class accepts (`_ExpressionInfo.first_run`) or the last letter's
+  (`last_letter`), wildcards excluded, in `_readings` and in the give-back.
+  Runs ending in the substitute ("bitchΗell") also needed the end-side
+  mirror: readings ending inside a deliberate final run (3+ characters, or
+  not two equal plain letters) with a right-neighbour requirement
+  (`_Reading.after`); two equal plain letters stay the word's own double, so
+  two split halves of "gittite" still cannot support each other.
+- Junction checks vs r14: plain runs 1..10 (4 x 20,000 texts) 0 broken,
+  German 835 more fixed, the rest unchanged; English junctions whose shared
+  run mixes the letter with a substitute ($S/junction3.py, 13,500 texts):
+  10,678 fixed, 0 broken, 1 left ("assess$kankfuck": "assess" is a word).
+  Tests: substitute-mixed runs (Greek eta/tau/kappa, "5", "$", "š", "3",
+  "é") at every length up to the retained run + 3, three run shapes each;
+  clean counterparts.
+- Differential vs r14, all 40 corpus runs: 0 lost, 1 gained (French
+  "prcsns" read as porc|cons, a consonant chain), 12 masks grown (native
+  "asssht" as ass|shat, "asssckr" as ass|suck, "bummmst"; the rest
+  cross-language fragments inside "**"). Sweep identical (789), dictionary
+  scan identical (845), windowed/compacted vs full rescan 0 diffs.
+  Throughput and tiny checks within 1%; adversarial worst cases +2-10%
+  ("*-" * 150 English 0.29s -> 0.32s), scaling ratios ~x4.
+  core.py 1227 -> 1251 statements.
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 13)
 - P2 split limit (8da405c): `_readings` tried leading-run splits only at the
   first 3 letters (`_GIVE_BACK_LIMIT`), while the run shortener keeps up to

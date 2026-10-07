@@ -478,14 +478,17 @@ class ProfanityFilter:
                 ends.extend(given_back(last))
         readings = [_Reading(start, last) for last in ends]
         # A match starting in a run of its first letter may leave the run's
-        # first letters to a reading before it, at any split point ("as|sshit",
-        # "bitttch|hell"). Such a reading only counts next to one that ends
-        # where it starts (see _Reading), so a double that is the word's own
-        # makes no compound ("git|tite"). Matched on the slice, as the start
-        # guard refuses starts inside the run.
+        # first letters to a reading before it, at any split point of the run
+        # ("as|sshit", "bitttch|hell", "bitchhh|hhell"). Such a reading only
+        # counts next to one that ends where it starts (see _Reading), so a
+        # double that is the word's own makes no compound ("git|tite").
+        # Matched on the slice, as the start guard refuses starts inside the
+        # run. The run is as long as the working text keeps it: the run
+        # shortener caps it per character (the longest run any word needs,
+        # 8 for hexadecimal digits), so this stays constant work per match.
         lead = matched[0].lower()
         if lead not in info.wildcards:
-            for run in range(1, min(len(matched), _GIVE_BACK_LIMIT + 1)):
+            for run in range(1, len(matched)):
                 if matched[run].lower() != lead:
                     break
                 readings.extend(

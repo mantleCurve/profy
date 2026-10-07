@@ -483,6 +483,41 @@ def test_readings_meet_inside_a_run_of_one_letter(english, text, clean):
     assert english.check(text).clean == clean
 
 
+def _retained_run(shield, character):
+    # How many of a long run of ``character`` the run shortener keeps.
+    run = character * 40
+    return len(shield.dictionary.runs.shorten(run, [(index, index + 1) for index in range(len(run))])[0])
+
+
+@pytest.mark.parametrize(
+    "language, left, right",
+    [
+        ("english", "bitch", "hell"),
+        ("english", "shit", "twat"),
+        ("english", "fuck", "kunt"),
+        ("english", "slut", "twat"),
+        ("german", "handjob", "bleicher"),
+        ("french", "dynastie", "espece"),  # "e" is a hex digit: 8 are kept
+        ("spanish", "porquería", "adios"),
+    ],
+)
+def test_readings_meet_anywhere_in_a_retained_run(language, left, right):
+    # Splits of the shared run were only tried at its first three letters, so
+    # "bitchhhhhell" came back "*********ell" and "shitttttwat" "********wat";
+    # every split the working text can hold is tried now.
+    shield = ProfanityFilter(languages=language)
+    letter = left[-1]
+    assert right[0] == letter
+    for size in range(2, _retained_run(shield, letter) + 4):
+        text = left[:-1] + letter * size + right[1:]
+        assert shield.check(text).clean == "*" * len(text), (text, shield.check(text).clean)
+
+
+@pytest.mark.parametrize("text", ["gittite", "woppish", "coffeeeeeel", "balllllad", "hellooooo"])
+def test_long_runs_in_ordinary_words_stay_clean(english, text):
+    assert english.check(text).clean == text
+
+
 @pytest.mark.parametrize(
     "text, options, clean",
     [

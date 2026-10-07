@@ -302,7 +302,7 @@ def test_deliberate_obfuscation_inside_a_word_is_still_caught(english, text):
         ("f-u-c-ks", "*******s"),
         # So does a separator inside one dictionary word, with its letter
         # repeated around it ("cockblocker", "shitspitter", "rapist").
-        ("cock*kblocker", "******blocker"),
+        ("cock*kblocker", "*************"),
         ("shit/tspitter", "*************"),
         ("rapis(st", "ra*****t"),
         # Symbols standing for letters are no separator ("lusting").
@@ -665,10 +665,11 @@ def _letter_runs(word, substitutions):
 
 # Known failures of the sample below, by cause (the full sweep over every
 # entry outside the suite finds no other kinds):
-# * a run with a substitute where the next letter also accepts the stretched
-#   letter, as "!" is "i" and "l" ("jai!ilbait") or French "c" accepts "s"
-#   ("des5cendances"): a run only keeps characters it shares with the next
-#   letter before one of its own that no later letter starts with;
+# * a run with a substitute that the next letter also accepts, where the
+#   letter after that one is the stretched letter again ("ani!ilingus": "!"
+#   may be the "l" and the "i" after it the next "i"), or with more than
+#   three such characters in a row ("närrissss5sssche"): a run only keeps
+#   them before one of its own that no letter they could reach starts with;
 # * Spanish "ll" and "rr", which the language reads as letters of their own;
 # * hexadecimal-looking tokens ("caa4aaca"), which are identifiers by design.
 KNOWN_RUN_FAILURES = {

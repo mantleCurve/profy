@@ -365,6 +365,43 @@ def test_runs_read_two_ways_scale_linearly(language, unit):
     assert_linear(shield, unit * (2000 // len(unit)), unit * (8000 // len(unit)))
 
 
+@pytest.mark.parametrize(
+    "word, make, size",
+    [
+        # Every occurrence of a block entry is found, overlapping ones too
+        # (see core._occurrence_patterns): periodic entries on periodic text,
+        # with runs that are not whole copies, and rejected occurrences
+        # followed by valid ones.
+        ("aa" * 8, lambda n: "a" * n + "a", 64000),
+        ("aa" * 50, lambda n: "a" * n + "a", 64000),
+        ("-a" * 8, lambda n: "-a" * (n // 2), 4000),
+        ("-a" * 50, lambda n: "-a" * (n // 2), 4000),
+        ("a-" * 8, lambda n: "a-" * (n // 2) + "b", 4000),
+        ("1234-1234", lambda n: "x" + "1234-" * (n // 5), 4000),
+        ("ab" * 8, lambda n: "ab" * (n // 2) + "x", 4000),
+    ],
+)
+def test_block_occurrences_are_found_in_linear_time(word, make, size):
+    assert_linear(ProfanityFilter(block=[word]), make(size), make(4 * size))
+
+
+@pytest.mark.parametrize(
+    "language, unit, size",
+    [
+        # Runs mixing a letter with characters the next letter shares, which
+        # a run keeps before one of its own when the letters those characters
+        # could reach do not start with it ("jai!ilbait", "des5cendances").
+        *[("english", unit, 1000) for unit in ["i!", "e3e"]],
+        *[("english", unit, 400) for unit in ["a**a", "*!"]],
+        *[("german", unit, 1000) for unit in ["s5", "c\u00a2c"]],
+        ("french", "s5", 1000),
+    ],
+)
+def test_runs_with_shared_characters_scale_linearly(language, unit, size):
+    shield = ProfanityFilter(languages=language)
+    assert_linear(shield, unit * (size // len(unit)), unit * (4 * size // len(unit)))
+
+
 def test_block_entries_matching_bundled_text_scale_linearly():
     # Each block occurrence rebuilt an index of the selected matches: with
     # only "shit" bundled and blocked, "shit " * 8000 took ~0.9s, 3x 4000.

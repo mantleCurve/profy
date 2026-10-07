@@ -387,11 +387,65 @@ def test_overlapping_occurrences_of_block_entries_are_all_masked():
     assert [(match.base, match.position, match.length) for match in result.matches] == [("$$", index, 2) for index in range(0, 14, 2)]
 
 
-def test_runs_of_a_repeated_block_word_keep_their_incomplete_rest():
-    # Complete occurrences are masked; a leftover shorter than the word is not.
-    assert filter_text("-" * 9, block=["--"]).clean == "*" * 8 + "-"
-    assert filter_text("\U0001F4A9" * 8, block=["\U0001F4A9" * 3]).clean == "*" * 6 + "\U0001F4A9" * 2
-    assert filter_text("!" * 101, block=["!!"]).clean == "*" * 100 + "!"
+def test_runs_of_a_repeated_block_word_mask_every_occurrence():
+    # Every occurrence is masked, overlapping ones included: the last "-" of
+    # "-" * 9 is part of the occurrence of "--" before it. (The default driver
+    # used to keep it, as only occurrences that do not overlap were masked.)
+    assert filter_text("-" * 9, block=["--"]).clean == "*" * 9
+    assert filter_text("\U0001F4A9" * 8, block=["\U0001F4A9" * 3]).clean == "*" * 8
+    assert filter_text("!" * 101, block=["!!"]).clean == "*" * 101
+    # A rest that no occurrence covers is kept.
+    assert filter_text("-x-", block=["-x"]).clean == "**-"
+    assert filter_text("-x-x-", block=["-x"]).clean == "****-"
+
+
+@pytest.mark.parametrize(
+    "word, text, clean, literal",
+    [
+        # A rejected occurrence (inside "x1234") used to hide the next one.
+        # (The default driver's other readings may mask more: "ab-ab" read
+        # inside "xab-ab", "12" after a letter.)
+        ("1234-1234", "x1234-1234-1234", "x1234-*********", "x1234-*********"),
+        ("1234-1234", "x1234-1234 1234-1234", "x1234-1234 *********", "x1234-1234 *********"),
+        ("ab-ab", "xab-ab-ab", "x********", "xab-*****"),
+        ("12", "a12 12", "a** **", "a12 **"),
+    ],
+)
+def test_a_rejected_block_occurrence_never_hides_the_next(word, text, clean, literal):
+    assert ProfanityFilter(block=[word]).clean(text) == clean
+    assert ProfanityFilter(block=[word], driver="pattern").clean(text) == literal
+
+
+@pytest.mark.parametrize(
+    "word, text, clean",
+    [
+        # Runs of a periodic entry: whole copies of it, overlapping ones too.
+        ("aa" * 4, "a" * 16, "*" * 16),
+        ("aa" * 4, "a" * 16 + " " + "a" * 8, "*" * 25),
+        ("-a" * 3, "-a" * 5, "*" * 10),
+        ("-a" * 3, "x" + "-a" * 5, "x" + "*" * 10),
+        ("a-" * 3, "a-" * 5 + "a", "*" * 10 + "a"),
+    ],
+)
+def test_periodic_block_entries_mask_every_occurrence(word, text, clean):
+    assert ProfanityFilter(block=[word]).clean(text) == clean
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_block_occurrences_cover_what_the_pattern_driver_masks(seed):
+    # Property: every character the pattern driver masks as an occurrence of
+    # a block word, the default driver masks too (it finds the same
+    # occurrences, and more: inside runs repeating the word, and next to "_").
+    rng = random.Random(f"exact-{seed}")
+    for _ in range(150):
+        word = "".join(rng.choice("ab1-!") for _ in range(rng.randint(1, 4)))
+        pieces = [word, word, word.upper(), "a", "b", "1", "-", "_", " ", "x", "!"]
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 10)))
+        pattern = ProfanityFilter(block=[word], driver="pattern").check(text)
+        expected = {index for match in pattern.matches if match.base == word for index in range(match.position, match.position + match.length)}
+        result = ProfanityFilter(block=[word]).check(text)
+        masked = {index for index, character in enumerate(result.clean) if character != text[index]}
+        assert expected <= masked, (word, text, result.clean, pattern.clean)
 
 
 def test_hex_like_runs_of_a_block_word_are_masked_only_when_complete():

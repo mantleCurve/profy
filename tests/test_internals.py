@@ -604,23 +604,31 @@ def test_short_texts_and_unknown_expressions_are_scanned_in_full():
     ]
 
 
-@pytest.mark.parametrize(
-    "text, root",
-    [("", 0), ("a", 1), ("aaaa", 1), ("1212", 2), ("121212", 2), ("12121", 5), ("abcab", 5), ("aabaab", 3), ("abab8", 5)],
-)
-def test_root_length(text, root):
-    assert core._root_length(text) == root
+def test_covering_keeps_one_chain_and_whatever_it_leaves_out():
+    assert core._covering([]) == []
+    # Copies of "aa" tiling "aaaa": the overlapping one adds nothing.
+    assert core._covering([(0, 2), (1, 3), (2, 4)]) == [(0, 2), (2, 4)]
+    # "a-a" three times in "a-a-a-a": the middle one covers the "-" between.
+    assert core._covering([(4, 7), (0, 3), (2, 5), (2, 5)]) == [(0, 3), (2, 5), (4, 7)]
 
 
 @pytest.mark.parametrize(
-    "text, unit, repeats",
+    "word, text, spans",
     [
-        ("12121212", "12", True), ("12121212", "1212", True), ("12121212", "121", False), ("12121212", "21", False),
-        ("12121212", "12121212", True), ("deadbeef1", "DeadBeef1", True), ("abab8", "ab", False), ("aaaa", "", False),
+        # A rejected occurrence (inside "x1234") hides nothing.
+        ("1234-1234", "x1234-1234-1234", [(6, 15)]),
+        ("a-a", "a-a-a", [(0, 3), (2, 5)]),
+        # Inside a run of letters and digits only whole copies count.
+        ("1212", "x1212 12121212 1212y", [(6, 10), (10, 14)]),
+        ("aa", "a" * 7 + " aaaa", [(8, 10), (10, 12)]),
+        ("ab", "Ab aB aab ab", [(0, 2), (3, 5), (10, 12)]),
+        ("hello world", "hello   world", [(0, 13)]),
     ],
 )
-def test_repeats_uses_the_root(text, unit, repeats):
-    assert core._repeats(text, core._root_length(text), unit) is repeats
+def test_exact_occurrences(word, text, spans):
+    shield = ProfanityFilter(block=[word])
+    found = shield._exact(shield.blocks, text, text, [(index, index + 1) for index in range(len(text))])
+    assert [(start, end) for start, end, *_ in found] == spans
 
 
 def test_given_back_letters_need_a_glued_follower():

@@ -237,37 +237,54 @@ class ProfanityFilter:
         normalization and run shortening can change their letters (German
         reads "Fischh|ändler" as "Fishh..." and stretched "schhh" as "sh"). An
         occurrence is the entry as typed (case-folded, whitespace runs
-        ignored) and not part of a longer alphanumeric token, or lies in a
-        token of nothing but the entry repeated ("1212|1212"). It skips every
-        heuristic guard. Occurrences of different entries may overlap
-        ("12-34" and "34-5678" in "12-34-5678"); one entry's are found left to
-        right."""
-        alphanumeric = _RunIndex(text, r"[^\W_]+")
-        token_roots: dict[tuple[int, int], tuple[str, int]] = {}
+        ignored) that neither starts nor ends inside a run of letters and
+        digits, or one of the copies of an entry of letters and digits that a
+        whole such run repeats ("1212|1212"). It skips every heuristic guard.
 
-        def is_exact(first: int, last: int, base: str) -> bool:
-            occurrence = _fold(text[first:last])
-            if occurrence != base and " " in base:
-                occurrence = " ".join(occurrence.split())
-            if occurrence == base and not (
-                first and _ALPHANUMERIC.match(text, first - 1) and _ALPHANUMERIC.match(text, first)
-            ) and not (last < len(text) and _ALPHANUMERIC.match(text, last - 1) and _ALPHANUMERIC.match(text, last)):
-                return True
-            token = alphanumeric.around(first, last)
-            if token not in token_roots:
-                folded = _fold(text[token[0] : token[1]])
-                token_roots[token] = (folded, _root_length(folded))
-            return _repeats(*token_roots[token], base)
+        Every occurrence is found, overlapping ones included, so one that is
+        rejected never hides another ("x1234-1234-1234" for "1234-1234").
+        Each entry's are reported left to right without overlaps, plus any
+        overlapping one that covers characters those leave out ("a-a-a" for
+        "a-a"). Occurrences of different entries may overlap ("12-34" and
+        "34-5678" in "12-34-5678")."""
+        found: list[tuple[int, int, int, str, Severity]] = []
+        # Case-folded once: _fold keeps every character's position.
+        folded = _fold(text)
 
-        return [
-            found
-            for base, literal in dictionary.block_literals
-            for occurrence in literal.finditer(text)
-            if is_exact(occurrence.start(), occurrence.end(), base)
-            for found in self._found(
-                dictionary, original, text_map[occurrence.start()][0], text_map[occurrence.end() - 1][1], 0, base
-            )
-        ]
+        def inside(index: int) -> bool:
+            # Between two letters or digits.
+            return 0 < index < len(text) and bool(_ALPHANUMERIC.match(text, index - 1) and _ALPHANUMERIC.match(text, index))
+
+        for base, literal, repeated in dictionary.block_literals:
+            occurrences = []
+            position = 0
+            seen = False
+            while True:
+                occurrence = literal.search(text, position)
+                if occurrence is None:
+                    break
+                seen = True
+                first, last = occurrence.span()
+                if inside(first):
+                    # So does every later start in this run of letters and
+                    # digits: its copies are found below.
+                    position = _PLAIN.match(text, first).end()
+                    continue
+                position = first + 1
+                if not inside(last):
+                    spelled = folded[first:last]
+                    if spelled != base and " " in base:
+                        spelled = " ".join(spelled.split())
+                    if spelled == base:
+                        occurrences.append((first, last))
+            # A run repeating the word holds an occurrence of it.
+            for run in repeated.finditer(text) if repeated is not None and seen else ():
+                first, last = run.span()
+                if not inside(first) and not inside(last) and folded[first:last] == base * ((last - first) // len(base)):
+                    occurrences.extend((start, start + len(base)) for start in range(first, last, len(base)))
+            for first, last in _covering(occurrences):
+                found += self._found(dictionary, original, text_map[first][0], text_map[last - 1][1], 0, base)
+        return found
 
     def _detect(
         self,
@@ -727,9 +744,10 @@ class _Dictionary:
         # keyed by id(): hashing a compiled pattern re-hashes its whole program.
         # The expressions live as long as this dictionary, so ids stay unique.
         self.stops: dict[int, re.Pattern[str]] = {}
-        # Each explicit block entry, as typed, longest first; see ProfanityFilter._exact.
+        # Each explicit block entry, as typed, longest first, with the patterns
+        # that find its occurrences (see ProfanityFilter._exact).
         self.block_literals = tuple(
-            (word, re.compile(r"\s+".join(re.escape(part) for part in word.split(" ")), re.IGNORECASE | re.UNICODE))
+            (word, *_occurrence_patterns(word))
             for word in sorted(dict.fromkeys(profanities), key=lambda item: (-len(item), item))
             if blocked
         )
@@ -1410,11 +1428,33 @@ def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
 
     def letter(index: int, token: _Token, follow_chars: frozenset) -> str:
         # The run of a letter that is not the last one, and the gap after it.
-        own, shared, absorbing = _split_options(token, follow_chars, _later_chars(tokens, index))
+        reaches = [_reachable_chars(tokens, index, length) for length in range(1, _AMBIGUOUS_LOOKAHEAD + 1)]
+        own, shared, absorbing = _split_options(token, follow_chars, reaches)
         # Shared characters ("*" in "fu**uck") stay in this run only when one
         # of its own characters follows within a few positions -- and only an
-        # own character no later letter could start with ("b*bo" keeps "*" for
-        # the "o" because the next "b" may be the profanity's second "b").
+        # own character that no letter those shared characters could reach
+        # starts with. Left to the letters that follow, each takes at least
+        # one of them, so after ``length`` of them the next character is read
+        # by a letter at most ``length`` non-optional letters further on
+        # (_reachable_chars): if none of those can start with it, the shared
+        # characters belong to this run. ("b*bo" keeps "*" for the "o" because
+        # the next "b" may be the profanity's second "b"; "jai!ilbait" keeps
+        # "!" in the "i" run, as only "b" is one letter past the "l".)
+        # Which characters these lookaheads accept never changes the bounds
+        # below, so the work per start position stays constant.
+
+        def stretch(length: int) -> Optional[str]:
+            # A stretch of at least ``length`` shared characters, longest
+            # first: "S(?:S(?:S(?=A3)|(?=A2))|(?=A1))" reads each one once.
+            options = [stretch(length + 1)] if length < _AMBIGUOUS_LOOKAHEAD else []
+            found = absorbing[length - 1]
+            if found:
+                options.append("" if found == own else f"(?={found})")
+            options = [option for option in options if option is not None]
+            if not options:
+                return None
+            return shared + (options[0] if len(options) == 1 else "(?:" + "|".join(options) + ")")
+
         # Runs are bounded (except the first letter's plain run, which the
         # start guard keeps linear) so that a run reached from any start
         # position does constant work: up to _RUN_LENGTH_LIMIT characters of
@@ -1423,10 +1463,14 @@ def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
         own_run = own if token.multi else f"{own}{{1,{_RUN_LENGTH_LIMIT}}}"
         if not own:
             repeats = ""
-        elif not shared or not absorbing:
+        elif not shared or not any(absorbing):
             repeats = f"{own}{{1,{_RUN_STEP_LIMIT}}}" if token.multi else own_run
         else:
-            lead = f"{shared}{{1,{_AMBIGUOUS_LOOKAHEAD}}}" + ("" if absorbing == own else f"(?={absorbing})")
+            found = absorbing[0]
+            if len(set(absorbing)) == 1:
+                lead = f"{shared}{{1,{_AMBIGUOUS_LOOKAHEAD}}}" + ("" if found == own else f"(?={found})")
+            else:
+                lead = stretch(1)
             if token.multi:
                 repeats = f"(?:(?:{lead})?{own}){{1,{_RUN_STEP_LIMIT}}}"
             else:
@@ -1500,21 +1544,27 @@ def _follow_chars(tokens: list[_Token], index: int) -> Optional[frozenset]:
     return None
 
 
-def _later_chars(tokens: list[_Token], index: int) -> frozenset:
-    """Case-folded characters that can start any letter after ``tokens[index]``."""
+def _reachable_chars(tokens: list[_Token], index: int, length: int) -> frozenset:
+    """Case-folded characters that can start a letter after ``tokens[index]``
+    once the letters after it have read ``length`` characters: one at most
+    ``length`` non-optional letters past the next one."""
     chars: set[str] = set()
-    for token in tokens[index + 1 :]:
+    passed = int(index + 1 < len(tokens) and not tokens[index + 1].optional)
+    for token in tokens[index + 2 :]:
+        if passed > length:
+            break
         if token.literal is not None:
             chars.add(token.literal.lower())
         chars.update(character.lower() for character in token.chars)
         chars.update(option[0].lower() for option in token.multi)
+        passed += not token.optional
     return frozenset(chars)
 
 
-def _split_options(token: _Token, follow_chars: frozenset, later_chars: frozenset) -> tuple[str, str, str]:
+def _split_options(token: _Token, follow_chars: frozenset, reaches: Iterable[frozenset]) -> tuple[str, str, list[str]]:
     """Expressions (empty when there are none) for the options only this letter
-    can use, those it shares with whatever follows it, and the own options that
-    no later letter can start with either."""
+    can use, those it shares with whatever follows it, and for each set of
+    ``reaches`` the own options that start with none of its characters."""
 
     def expression(chars: list[str], multi: list[str]) -> str:
         return _options_expression(chars, multi) if chars or multi else ""
@@ -1523,13 +1573,14 @@ def _split_options(token: _Token, follow_chars: frozenset, later_chars: frozense
     own_multi = [option for option in token.multi if option[0].lower() not in follow_chars]
     shared_chars = [character for character in token.chars if character not in own_chars]
     shared_multi = [option for option in token.multi if option not in own_multi]
-    absorbing_chars = [character for character in own_chars if character.lower() not in later_chars]
-    absorbing_multi = [option for option in own_multi if option[0].lower() not in later_chars]
-    return (
-        expression(own_chars, own_multi),
-        expression(shared_chars, shared_multi),
-        expression(absorbing_chars, absorbing_multi),
-    )
+    absorbing: dict[frozenset, str] = {}
+    for reach in reaches:
+        if reach not in absorbing:
+            absorbing[reach] = expression(
+                [character for character in own_chars if character.lower() not in reach],
+                [option for option in own_multi if option[0].lower() not in reach],
+            )
+    return expression(own_chars, own_multi), expression(shared_chars, shared_multi), [absorbing[reach] for reach in reaches]
 
 
 def _start_guard(token: _Token, own: str, follow_chars: frozenset) -> str:
@@ -2048,29 +2099,41 @@ _HEX_CHARACTER = re.compile(r"[0-9a-fA-F]")
 _HEX_RUN = re.compile(r"[0-9a-fA-F-]+")
 
 
-def _root_length(text: str) -> int:
-    """Length of the shortest string ``text`` is a repetition of ("1212" -> 2),
-    via the KMP prefix function (linear on every Python version)."""
-    if not text:
-        return 0
-    border = [0] * len(text)
-    length = 0
-    for index in range(1, len(text)):
-        while length and text[index] != text[length]:
-            length = border[length - 1]
-        if text[index] == text[length]:
-            length += 1
-        border[index] = length
-    period = len(text) - border[-1]
-    return period if len(text) % period == 0 else len(text)
+def _occurrence_patterns(word: str) -> tuple[re.Pattern[str], Optional[re.Pattern[str]]]:
+    """For ProfanityFilter._exact: ``word`` as typed (case-insensitive, any
+    whitespace for a space), and for a word of letters and digits, two or
+    more copies of it in a row (a run of letters and digits may repeat it).
+
+    Both start with the word itself, so the regex engine skips ahead to its
+    first character, and _exact scans in time linear in the text: inside a
+    run of letters and digits an occurrence is only looked at where the run
+    starts, and copies are matched without overlapping. A run repeating a
+    word is only possible for a word of letters and digits: the runs
+    touching an occurrence of a word with any other character spell less
+    than one more copy of it."""
+    body = r"\s+".join(re.escape(part) for part in word.split(" "))
+    literal = re.compile(body, re.IGNORECASE | re.UNICODE)
+    repeated = re.compile(f"(?:{body}){{2,}}", re.IGNORECASE | re.UNICODE) if _PLAIN.fullmatch(word) else None
+    return literal, repeated
 
 
-def _repeats(folded: str, root: int, unit: str) -> bool:
-    """Whether ``folded`` (case-folded, with its root length) is ``unit`` once
-    or more, case-insensitively, in time linear in ``unit``: the unit must be a
-    whole number of roots, fit a whole number of times and start the text."""
-    unit = _fold(unit)
-    return bool(unit) and not len(unit) % root and not len(folded) % len(unit) and folded.startswith(unit)
+def _covering(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """``spans`` (start, end) left to right without overlaps, then each other
+    one that covers characters the chosen ones leave out."""
+    chosen: list[tuple[int, int]] = []
+    rest: list[tuple[int, int]] = []
+    for span in sorted(set(spans)):
+        (chosen if not chosen or span[0] >= chosen[-1][1] else rest).append(span)
+    if rest:
+        covered = bytearray(max(last for _, last in rest + chosen))
+        for first, last in chosen:
+            covered[first:last] = b"\x01" * (last - first)
+        for first, last in rest:
+            if covered.find(0, first, last) >= 0:
+                chosen.append((first, last))
+                covered[first:last] = b"\x01" * (last - first)
+        chosen.sort()
+    return chosen
 
 
 def _is_hex_token(token: str) -> bool:

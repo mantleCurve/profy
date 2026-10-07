@@ -246,10 +246,11 @@ class ProfanityFilter:
                     hex_verdicts[token] = _is_hex_token(working[token[0] : token[1]])
                 return hex_verdicts[token]
 
-            def evaluate(start: int, end: int, base: str, number: int, info: _ExpressionInfo) -> None:
+            def evaluate(reading: _Reading, base: str, number: int, info: _ExpressionInfo) -> None:
                 """Judge one reading by the guards that only depend on its own
                 text and context; add it to the pass's candidates unless one
                 rejects it."""
+                start, end = reading.start, reading.end
                 matched = working[start:end]
                 # Masked characters (\x01) are never reused.
                 if "\x01" in matched or (hits and splits_a_hit(start, end)):
@@ -294,6 +295,8 @@ class ProfanityFilter:
                         needs = ((bool(guard[1]) and not touches_before, bool(guard[2]) and not touches_after),)
                     if not needs:
                         return
+                if reading.before:
+                    needs = tuple(dict.fromkeys((True, right) for _, right in needs))
                 word_start, word_end = words.around(start, end)
                 if (
                     word_end - word_start <= dictionary.longest_false_positive
@@ -321,17 +324,21 @@ class ProfanityFilter:
                 info = dictionary.info(base, expression)
                 # A reading that ends early frees letters finditer() has already
                 # passed; the next occurrence of the same expression may start
-                # in them and is judged next.
+                # in them and is judged next. A match is judged once, however
+                # many others lead to it (copies glued to copies), so each
+                # expression costs time linear in its matches.
                 stack = list(reversed(found))
+                seen: set[tuple[int, int]] = set()
                 while stack:
                     start, end, matched = stack.pop()
                     # A zero-length match can never be masked; inside a hex-like
                     # token every reading of a match lies in it too.
-                    if not matched or in_hex_token(start, end, matched):
+                    if not matched or (start, end) in seen or in_hex_token(start, end, matched):
                         continue
+                    seen.add((start, end))
                     readings, follows = self._readings(working, start, end, matched, base, expression, info)
-                    for first, last in readings:
-                        evaluate(first, last, base, number, info)
+                    for reading in readings:
+                        evaluate(reading, base, number, info)
                     stack.extend(follows)
 
             selected = _select(candidates, masked, required)
@@ -417,16 +424,16 @@ class ProfanityFilter:
         base: str,
         expression: re.Pattern[str],
         info: "_ExpressionInfo",
-    ) -> tuple[list[tuple[int, int]], list[tuple[int, int, str]]]:
-        """The spans of the readings of one match of ``expression``, and the
+    ) -> tuple[list["_Reading"], list[tuple[int, int, str]]]:
+        """The readings of one match of ``expression``, and the
         following occurrences of the expression finditer() would skip (as
         start, end, text).
 
         The readings are the match, or a shorter one that keeps out of the
         next word (see ``_unbled``); one ending a few characters earlier that
         gives them back to a copy that follows ("twatt|wat", "soltar
-        pedoss|oltar pedos"); and ones starting later in a stretched run of the
-        first letter. The selection chooses between them.
+        pedoss|oltar pedos"); and ones starting later in a run of the first
+        letter. The selection chooses between them.
         """
         dictionary = self.dictionary
         follows: list[tuple[int, int, str]] = []
@@ -469,20 +476,23 @@ class ProfanityFilter:
                         follows.append((position, found.end(), found.group(0)))
                         break
                 ends.extend(given_back(last))
-        readings = [(start, last) for last in ends]
-        # Likewise at the start: a match starting in a stretched run of its
-        # first letter may leave the run's first letters to a profanity before
-        # it ("as|sshit" in "assshit"; a double is the word's own, as in
-        # "git|tite"); matched on the slice, as the start guard refuses starts
-        # inside that run.
+        readings = [_Reading(start, last) for last in ends]
+        # A match starting in a run of its first letter may leave the run's
+        # first letters to a reading before it, at any split point ("as|sshit",
+        # "bitttch|hell"). Such a reading only counts next to one that ends
+        # where it starts (see _Reading), so a double that is the word's own
+        # makes no compound ("git|tite"). Matched on the slice, as the start
+        # guard refuses starts inside the run.
         lead = matched[0].lower()
-        if lead not in info.wildcards and _STRETCHED_LETTERS.match(matched.lower()):
+        if lead not in info.wildcards:
             for run in range(1, min(len(matched), _GIVE_BACK_LIMIT + 1)):
                 if matched[run].lower() != lead:
                     break
-                for last in ends:
-                    if last > start + run and expression.fullmatch(working[start + run : last]):
-                        readings.append((start + run, last))
+                readings.extend(
+                    _Reading(start + run, last, True)
+                    for last in ends
+                    if last > start + run and expression.fullmatch(working[start + run : last])
+                )
         return readings, follows
 
     def _unbled(self, working: str, start: int, end: int, base: str, expression: re.Pattern[str]) -> Optional[int]:
@@ -1498,6 +1508,16 @@ def _chain_needs(guard: tuple, touches_before: bool, touches_after: bool) -> tup
         ):
             needs.append((need_before and not touches_before, need_after and not touches_after))
     return tuple(needs)
+
+
+class _Reading(NamedTuple):
+    """A span of the working text one match can be read as, and whether it
+    only counts next to a chosen reading (or an earlier pass's match) that
+    ends where it starts: it starts inside a run of one letter."""
+
+    start: int
+    end: int
+    before: bool = False
 
 
 class _Candidate(NamedTuple):

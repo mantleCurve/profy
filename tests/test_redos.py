@@ -251,3 +251,26 @@ def test_match_dense_text_with_the_default_filter(english):
     assert english.check("shit " * 2000).count == 2000
     assert large < 5.0, large
     assert large / max(small, 0.02) < 9, (small, large)
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        pytest.param("twat", id="plain"),
+        pytest.param("twaat", id="stretched"),
+        pytest.param("twatt", id="stretched-end"),
+        pytest.param("dickwad", id="long"),
+        pytest.param("shitass", id="mixed-entries"),
+        pytest.param("shit-ass", id="hyphenated-entry"),
+        pytest.param("shit-ass,", id="separator"),
+    ],
+)
+def test_glued_copies_scale_linearly(english, unit):
+    # Each copy's reading led to the next copy again from every earlier one,
+    # so the same matches were judged over and over: "twat" * 640 took ~1.4s,
+    # 13x the time of a quarter of it.
+    small = _best_of_two(english, unit * 160)
+    large = _best_of_two(english, unit * 640)
+    assert english.check(unit * 640).clean.count("*") >= len(unit.rstrip(",")) * 640
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)

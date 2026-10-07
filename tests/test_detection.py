@@ -452,6 +452,38 @@ def test_the_selection_covers_every_copy(text, options, clean):
 
 
 @pytest.mark.parametrize(
+    "text, clean",
+    [
+        # A reading may start at any split of a run of its first letter that
+        # another reading ends at: "bitttch|hell" (the "hh" split in two).
+        ("bitttchhell", "***********"),
+        ("bitchhhell", "**********"),
+        ("shiittthell", "***********"),
+        ("shitthell", "*********"),
+        ("fuckkkass", "*********"),
+        ("fuckkshit", "*********"),
+        ("asssshole", "*********"),
+        ("asshhole", "********"),
+        ("hellllass", "*********"),
+        ("cuntttits", "*********"),
+        ("assshit", "*******"),
+        ("rapisttaff", "**********"),
+        ("coitussexxx", "***********"),
+        ("basterdsspazza", "**************"),
+        ("shitcuntthicko", "**************"),
+        ("pisseddickmonger", "****************"),
+        # Unless the double is the word's own: no reading ends at the split.
+        ("gittite", "gittite"),
+        ("woppish", "woppish"),
+        ("cookkook", "cookkook"),
+        ("helloass", "helloass"),
+    ],
+)
+def test_readings_meet_inside_a_run_of_one_letter(english, text, clean):
+    assert english.check(text).clean == clean
+
+
+@pytest.mark.parametrize(
     "text, options, clean",
     [
         # The end of a word read into the next is no match, even next to

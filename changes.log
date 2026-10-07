@@ -1,5 +1,37 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 12)
+- P1 quadratic candidate generation (6a72a6f): follows of glued copies led
+  back to matches other copies had already reached, and each was re-judged
+  ("twat" * 320: 51,360 reading evaluations vs 3,240 at 80 copies; 640 copies
+  1.43s, x13 per x4; "shit-ass", "dickwad", "twaat" likewise). Each raw match
+  is now judged once per expression and pass (`seen` in check()); a raw span
+  fully determines its readings and follows, so this changes no result.
+  "twat" * 640: 0.13s, x3.7. Regression test over 7 shapes (plain,
+  stretched, stretched end, long, mixed entries, hyphenated entry,
+  separator; r12 x10.9-14.7, now x3.7-4.0).
+- P2 boundary readings: "bitttchhell" gave "********ell" (r11 masked all):
+  the leading-run trim only split runs of three or more, so "hell" [7,11)
+  was never a reading after "bitttch". The trim now splits any run of the
+  first letter (up to _GIVE_BACK_LIMIT), and a trimmed reading (`_Reading.
+  before`) only counts next to a chosen reading ending where it starts (it
+  gets the left need in every alternative), so a double that is the word's
+  own invents no compound ("git|tite", "wop|pish"). Trailing splits at both
+  sides were tried and dropped: two split readings of one double supported
+  each other ("git|t|tite").
+- Junction sweep ($S/junction.py: 6,000 random pairs of bundled English
+  entries A+B with A's last letter = B's first, the junction letter doubled
+  and tripled, 11,998 texts): r12 11,540 fully masked, now 11,991; 451
+  fixed, 0 broken; the 7 left need a run longer than the give-back limit
+  ("peeenusssss...").
+- Differential vs r12, all 40 corpus runs: 0 lost, 0 gained, 1 mask grown
+  ("cockknobbing"), 4 match changes ("fuck|knob" instead of "fuckk|nob").
+  Sweep: identical (789). Dictionary scan: 845, identical set and masks.
+  Windowed/compacted vs full rescan: 0 diffs (65,903 texts x 3 x 4).
+  Timing vs r12: throughput and tiny checks within 1%; adversarial worst
+  cases +3-5% ("* " * 200 English 0.42s -> 0.44s, all languages 0.82s ->
+  0.85s), every scaling ratio ~x4.
+
 ## 2026-10-07 (fix/codex-review-hardening, match-selection redesign + Codex review pass 11)
 - Selection redesign (Codex pass 10 assessment): check() no longer accepts
   candidates one at a time in expression order. Per pass, every finditer()

@@ -1,5 +1,65 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 19)
+- [P2] an input "\x01" counted as an earlier match: masked text was
+  replaced by "\x01", and "is this position masked" compared characters, so
+  the compound rule leaned on any "\x01" in the input. "\x01hellenic" was
+  masked "\x01****enic", "\x01cockatoo" "\x01****atoo" and "shell\x01hello"
+  "s****\x01hello" (main leaves all three unchanged). Readings containing an
+  input "\x01" were also rejected (block=["a\x01"] left "xa\x01" unmasked,
+  where "a$" masks "xa$").
+- Masked positions are now kept outside the text: `_detect` keeps a
+  bytearray of masked positions, and the three readers use it: `masked()`,
+  the "masked characters are never reused" check, and compaction in
+  `_CandidateFinder`, which collapses runs of masked positions.
+- The working text still shows masks as a placeholder, so no expression
+  reads through one. Each dictionary picks it (`_placeholder`): the first
+  candidate in every stop class of its expressions. The candidates are
+  "\x01", then the private-use characters; none is a letter, digit, "_",
+  "-" or whitespace, and none has case variants (asserted for every
+  candidate).
+- The placeholder is "\x01" unless a block entry makes that readable;
+  block=["\x01x"] gives "". A block list that reads every candidate
+  raises ValueError at construction (tested with a two-character candidate
+  list).
+- An input occurrence of the placeholder needs no neutralizing. No
+  expression reads it, so it reads like a mask while the flags say it is
+  not one, and the output is built from the original text as before.
+- Audit of every in-band marker: "\x01" was the only one (10 occurrences:
+  `masked()`, the reuse check, compaction and `_mask_spans`, plus six in
+  comments and docstrings). Stop classes are built from the characters
+  each expression reads; windowing uses stop classes and the changed spans;
+  run shortening only removes characters; normalization keeps span maps; the
+  pattern driver never masks working text.
+- Tests:
+  - Property test, both drivers, block lists (), ("zork",) and
+    ("\x01x", "zork"): for "\x00"-"\x1f", "\x7f", U+FFFD, U+FFFF,
+    U+E000, U+F8FF, U+F0000 and U+10FFFD next to clean words and
+    profanities, clean words stay clean, the characters are kept exactly,
+    and profanities are masked exactly. r19 fails 48 cases, all "\x01" with
+    the regex driver.
+  - Placeholder choice and exhaustion; the candidate properties.
+  - The strategy-equivalence test gained three texts with such characters
+    and a block list that moves the placeholder (4 cases, was 2).
+- Probes against r19:
+  - An input "\x01" reads exactly like "\x02" (masks, matches with
+    severities, score), in about 3,130 texts per language × 4 languages ×
+    both drivers × with and without block entries ($S/inv19.py). 0
+    violations; r19 has 1,410.
+  - Windowed or compacted vs full rescan on corpora joined by those
+    characters, with and without the placeholder moved
+    ($S/equiv19.py, 4 languages × 3 strategies × 2 block lists): 0 diffs.
+  - Texts joined by those characters ($S/diff19.py, 6,000 per language,
+    both drivers, with and without block entries): every difference
+    contains "\x01", all with the regex driver.
+- Differential vs r19 (no "\x01" in them): 40 corpus runs 0 differing
+  results, 0 timeouts; sweep identical in all 4 languages; dictionary scan
+  845 flagged, identical.
+- Performance vs r19 (CPU time, best of 3): tiny checks, prose, clean and
+  German throughput, and block filters with 50 and 200 words (build, prose,
+  tiny) at parity, within run-to-run noise.
+- core.py 1290 -> 1303 statements, 502 -> 508 branches.
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 18)
 - [P2] the block-entry precheck skipped valid matches: block=["zip"] left
   "zİp" and "z-İ-p" unmasked (main "***", "*****"). Its letter sets came from

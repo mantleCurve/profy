@@ -97,8 +97,9 @@ def test_scan_loop_never_accepts_zero_length_matches():
 
 
 def test_scan_loop_ignores_matches_over_already_masked_text():
-    # Masked characters are replaced by \x01, which no generated expression can
-    # match; a custom expression that could must still not re-report them.
+    # Masked characters are replaced by the placeholder ("\x01" here), which no
+    # generated expression can match; a custom expression that could must
+    # still not re-report them.
     shield = _with_extra_expressions(ProfanityFilter(block=["zz-masked"]), ("\x01", re.compile("\x01+")))
     result = _within(30, shield.check, "shit")
     assert result.clean == "****"
@@ -253,8 +254,8 @@ def test_run_index():
 
 
 def test_mask_spans():
-    assert core._mask_spans("abcdef", [(4, 5), (0, 2)]) == "\x01\x01cd\x01f"
-    assert core._mask_spans("abc", []) == "abc"
+    assert core._mask_spans("abcdef", [(4, 5), (0, 2)], "\x01") == "\x01\x01cd\x01f"
+    assert core._mask_spans("abc", [], "\x01") == "abc"
 
 
 @pytest.mark.parametrize(
@@ -531,6 +532,10 @@ STRATEGY_TEXTS = [
     "coo-on koo oon pimm-mel " * 30,
     ("f" + "u\u00fc" * 40 + "ck " + "\U0001F4A9" * 9 + " ") * 20,
     "fuckfuckfuck shitshit " * 30,
+    # Characters like the placeholder in the input: only masks are masked.
+    "\x01hellenic \x01cockatoo shit\x01shit \x01\x01\x01 fuck " * 20,
+    "".join(chr(point) + "shit " + chr(point) + "hello " for point in [*range(0x20), 0x7F, 0xFFFD, 0xFFFF, 0xE000, 0xF0000]) * 4,
+    "\ue000x \ue000fuck shit\ue000\ue000 \x01x " * 20,
 ]
 
 
@@ -539,14 +544,21 @@ def _result_key(result):
 
 
 @pytest.mark.parametrize("languages", ["english", "german"])
-def test_confirming_pass_strategies_are_equivalent(monkeypatch, languages):
-    full = ProfanityFilter(languages=languages)
+@pytest.mark.parametrize("block", [(), ("\x01x", "zork", "shit")])
+def test_confirming_pass_strategies_are_equivalent(monkeypatch, languages, block):
+    full = ProfanityFilter(languages=languages, block=block)
     expected = []
     dictionary = copy.copy(full.dictionary)
     dictionary.stops = {}  # every pass scans the whole text
     full.dictionary = dictionary
+    if block:
+        # "\x01x" makes "\x01" readable, so masks read as a private-use character.
+        assert full.blocks.placeholder == "\ue000"
+        blocks = copy.copy(full.blocks)
+        blocks.stops = {}
+        full.blocks = blocks
     expected = [_result_key(full.check(text)) for text in STRATEGY_TEXTS]
-    shield = ProfanityFilter(languages=languages)
+    shield = ProfanityFilter(languages=languages, block=block)
     # Every confirming pass's strategy, to show each spacing chose the one it
     # is meant to test.
     modes = []
@@ -574,18 +586,18 @@ def test_windowed_rescan_falls_back_for_empty_matches(monkeypatch):
     loose = re.compile("x*")
     text = "ab\x01\x01xx"
     expected = [(match.start(), match.end(), match.group(0)) for match in loose.finditer(text)]
-    finder = core._CandidateFinder(text, [(2, 4)], {id(loose): re.compile("[^x]")})
+    finder = core._CandidateFinder(text, [(2, 4)], {id(loose): re.compile("[^x]")}, bytearray(b"\0\0\1\1\0\0"))
     assert finder.mode == "windowed"
     assert finder.candidates(loose, [(0, 0, "")]) == expected
     assert finder.candidates(loose, []) == expected
 
 
 def test_short_texts_and_unknown_expressions_are_scanned_in_full():
-    finder = core._CandidateFinder("shit", [(0, 4)], {})
+    finder = core._CandidateFinder("shit", [(0, 4)], {}, bytearray(b"\1" * 4))
     assert finder.mode == "full"
     loose = re.compile("x")
     long_text = "x" * 600
-    finder = core._CandidateFinder(long_text, [(0, 1)], {})
+    finder = core._CandidateFinder(long_text, [(0, 1)], {}, bytearray(b"\1" + b"\0" * 599))
     assert finder.mode == "windowed"
     assert finder.candidates(loose, None) == finder.candidates(loose, []) == [
         (index, index + 1, "x") for index in range(600)
@@ -674,3 +686,26 @@ def test_block_precheck_never_skips_a_case_insensitive_match(word, options):
     if word == "zip":
         assert shield.check("z\u0130p").clean == "***" and shield.check("z-\u0130-p").clean == "*****"
 
+
+
+def test_placeholder_candidates_end_words_and_have_no_case():
+    # Masked text reads as a candidate in later passes: it must end words,
+    # hex tokens and runs of letters like punctuation, and no case-insensitive
+    # class may read it through another character.
+    for character in core._placeholder_candidates():
+        assert not re.fullmatch(r"[\w\s-]", character), repr(character)
+        assert character.lower() == character.upper() == character.casefold() == character, repr(character)
+
+
+def test_placeholder_is_a_character_no_expression_reads(monkeypatch):
+    shield = ProfanityFilter(block=["zork"])
+    assert shield.dictionary.placeholder == shield.blocks.placeholder == "\x01"
+    # A block entry spelling "\x01" moves the block dictionary's placeholder.
+    shield = ProfanityFilter(block=["\x01x", "y"])
+    assert (shield.dictionary.placeholder, shield.blocks.placeholder) == ("\x01", "")
+    assert all(stop.fullmatch("") for stop in shield.blocks.stops.values())
+    assert shield.clean("\x01x y \x01hellenic fuck") == "** ** \x01hellenic ****"
+    # Only if the entries read every candidate is there none.
+    monkeypatch.setattr(core, "_placeholder_candidates", lambda: iter("\x01"))
+    with pytest.raises(ValueError, match="no private-use character"):
+        ProfanityFilter(block=["\x01zz-exhausted"])

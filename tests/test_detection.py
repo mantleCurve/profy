@@ -942,3 +942,30 @@ def test_reusable_filter_matches_one_shot_helper(english):
         assert english.check(text) == filter_text(text)
     assert english.clean("shit") == "****"
     assert ProfanityFilter(languages=["english"]).check("shit") == english.check("shit")
+
+
+# Control characters, the replacement character, a noncharacter and
+# private-use characters, among them "\x01" and "", which masked text
+# reads as in later passes ("\x01hellenic" was masked "\x01****enic": the input
+# "\x01" counted as an earlier match the compound rule may lean on).
+UNUSUAL = [chr(point) for point in range(0x20)] + ["\x7f", "�", "￿", "", "", "\U000f0000", "\U0010fffd"]
+
+
+@pytest.mark.parametrize("driver", ["regex", "pattern"])
+@pytest.mark.parametrize("block", [(), ("zork",), ("\x01x", "zork")])
+def test_unusual_characters_are_kept_and_never_count_as_matches(driver, block):
+    shield = ProfanityFilter(driver=driver, block=block)
+    for character in UNUSUAL:
+        for word in ["hellenic", "cockatoo", "class", "assessment", "shell", "hello", "passion", "Scunthorpe"]:
+            for text in (character + word, word + character, character * 3 + word, word + character + word, "shell" + character + "hello"):
+                result = shield.check(text)
+                assert (result.clean, result.matches) == (text, ()), (driver, block, text)
+        for word in ("fuck", "shit") + (("zork",) if block else ()):
+            for text in (
+                character + word,
+                word + character,
+                character + word + character,
+                character * 3 + word + " " + word + character * 2,
+                "hello" + character + word,
+            ):
+                assert shield.check(text).clean == text.replace(word, "*" * len(word)), (driver, block, text)

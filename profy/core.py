@@ -11,7 +11,7 @@ from math import lcm
 import re
 from types import MappingProxyType
 import unicodedata
-from typing import Callable, Container, Iterable, Mapping, NamedTuple, Optional, Union
+from typing import Callable, Container, Iterable, Iterator, Mapping, NamedTuple, Optional, Union
 
 
 class Severity(str, Enum):
@@ -295,19 +295,23 @@ class ProfanityFilter:
         letters = _RunIndex(normalized, r"[a-zA-Z]+")
         results: list[tuple[int, int, int, str, Severity]] = []
         working = normalized
+        # Which positions earlier passes masked. The working text shows them as
+        # the dictionary's placeholder, which the input may hold too, so only
+        # this says whether a position is masked.
+        masks = bytearray(len(normalized))
         candidates: list[_Candidate] = []
         # Each expression's matches in the previous pass, and the spans that pass
         # masked: a confirming pass only rescans where those masks can matter.
         previous: dict[int, list[tuple[int, int, str]]] = {}
         changed: list[tuple[int, int]] = []
         # Each pass collects every candidate reading, then selects a set of
-        # them (see _select) and masks it with \x01; the next pass sees those
+        # them (see _select) and masks it; the next pass sees those
         # masks, which a compound or a chain may lean on. Scanning stops when a
         # pass selects nothing. ``working`` is already whitespace-collapsed and
         # masking never adds whitespace, so (unlike Blasp) it is not
         # re-collapsed on every pass.
         while True:
-            finder = _CandidateFinder(working, changed, dictionary.stops)
+            finder = _CandidateFinder(working, changed, dictionary.stops, masks)
             # Every context lookup is a bisect into runs computed once per pass,
             # so each candidate costs time independent of the text length.
             words = _RunIndex(working, r"\w+")
@@ -315,7 +319,7 @@ class ProfanityFilter:
             hex_verdicts: dict[tuple[int, int], bool] = {}
 
             def masked(index: int) -> bool:
-                return 0 <= index < len(working) and working[index] == "\x01"
+                return 0 <= index < len(masks) and masks[index] == 1
 
             def in_hex_token(start: int, end: int, matched: str) -> bool:
                 # A UUID or long hexadecimal identifier, not a word.
@@ -332,8 +336,8 @@ class ProfanityFilter:
                 rejects it."""
                 start, end = reading.start, reading.end
                 matched = working[start:end]
-                # Masked characters (\x01) are never reused.
-                if "\x01" in matched:
+                # Masked characters are never reused.
+                if masks.find(1, start, end) >= 0:
                     return
                 # A match that only exists by leaving the vowel out must spell
                 # every consonant ("fck", "f--ck", "$ht"); a character any of
@@ -427,7 +431,9 @@ class ProfanityFilter:
             spans = _merge_spans((candidate.start, candidate.end) for candidate in selected)
             if not spans:
                 break
-            working = _mask_spans(working, spans)
+            working = _mask_spans(working, spans, dictionary.placeholder)
+            for start, end in spans:
+                masks[start:end] = b"\x01" * (end - start)
             changed = spans
             candidates = []
 
@@ -800,6 +806,8 @@ class _Dictionary:
                 )
 
             self.runs = None if blocked else shortener(spellings)
+            # What masked text reads as in later passes (see _placeholder).
+            self.placeholder = _placeholder(self.stops.values())
         # Longest first. A word's per-letter variant goes before its expression
         # with multi-letter keys: it reads every spelling the other reads in the
         # normalized text, and more ("5cheiss" whole, not "5|cheiss").
@@ -1784,8 +1792,9 @@ class _CandidateFinder:
     (start, end, text) tuples, computed cheaply on confirming passes.
 
     A confirming pass sees the previous pass's text with ``changed`` spans
-    replaced by \x01, which no generated expression reads past (it is in every
-    stop class). Two exact shortcuts follow:
+    replaced by the placeholder, which no generated expression reads past (it
+    is in every stop class); ``masks`` flags every masked position. Two exact
+    shortcuts follow:
 
     * Windowed rescan: an attempt starting at ``p`` reads only ``[p - 1, s]``
       (``s`` = first stop character at or after ``p``), so only attempts in a
@@ -1794,17 +1803,18 @@ class _CandidateFinder:
       previous pass's matches are reused, and real searches are bounded by
       ``endpos`` just past the stop character ending the zone, which no
       attempt in the zone reads beyond.
-    * Compaction: runs of \x01 are collapsed to one character (an attempt
-      reads at most the first of them, and the look-behind at most the last),
-      the compacted text is scanned, and positions are mapped back.
+    * Compaction: runs of masked positions are collapsed to one character (an
+      attempt reads at most the first of them, and the look-behind at most the
+      last), the compacted text is scanned, and positions are mapped back.
 
     Expressions without a known stop class (anything not generated here) are
     always scanned in full.
     """
 
-    def __init__(self, text: str, changed: list[tuple[int, int]], stops: Mapping[int, re.Pattern[str]]):
+    def __init__(self, text: str, changed: list[tuple[int, int]], stops: Mapping[int, re.Pattern[str]], masks: bytearray):
         self.text = text
         self.stops = stops
+        self.masks = masks
         # Sorted, disjoint and not touching (see _merge_spans).
         self.blocks = [list(span) for span in changed]
         self.reversed = ""
@@ -1838,7 +1848,7 @@ class _CandidateFinder:
             pieces: list[str] = []
             origin: list[int] = []
             cursor = 0
-            for run in re.finditer("\x01{2,}", self.text):
+            for run in re.finditer(rb"\x01{2,}", self.masks):
                 pieces.append(self.text[cursor : run.start() + 1])
                 origin.extend(range(cursor, run.start() + 1))
                 cursor = run.end()
@@ -1846,7 +1856,7 @@ class _CandidateFinder:
             origin.extend(range(cursor, len(self.text) + 1))
             self.compact = ("".join(pieces), origin)
         text, origin = self.compact
-        # Matches never contain \x01, so both ends map back directly.
+        # Matches never contain a masked position, so both ends map back directly.
         return [
             (origin[found.start()], origin[found.end() - 1] + 1, found.group(0)) for found in expression.finditer(text)
         ]
@@ -1942,13 +1952,34 @@ def _merge_spans(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def _mask_spans(text: str, spans: list[tuple[int, int]]) -> str:
-    """``text`` with every (disjoint) span replaced by \x01 characters."""
+def _placeholder_candidates() -> Iterator[str]:
+    # "\x01", then the private-use characters: none is a letter, digit, "_",
+    # "-" or whitespace, so each ends a word, a hex token and a run of letters
+    # like punctuation does, and none has case variants.
+    return chain("\x01", map(chr, range(0xE000, 0xF900)), map(chr, range(0xF0000, 0x110000)))
+
+
+def _placeholder(stops: Iterable[re.Pattern[str]]) -> str:
+    """The character masked text is replaced by in the working text of later
+    passes: the first candidate no expression reads (in every stop class), so
+    a match never runs through a mask. The text may hold it too: masked
+    positions are tracked apart from it (see ProfanityFilter._detect), and
+    expressions read an occurrence in the text and a mask alike. "\\x01"
+    unless a block entry makes it readable."""
+    stops = list(stops)
+    for character in _placeholder_candidates():
+        if all(stop.fullmatch(character) for stop in stops):
+            return character
+    raise ValueError("block entries leave no private-use character free to mask matched text with")
+
+
+def _mask_spans(text: str, spans: list[tuple[int, int]], placeholder: str) -> str:
+    """``text`` with every (disjoint) span replaced by ``placeholder``."""
     pieces: list[str] = []
     cursor = 0
     for start, end in sorted(spans):
         pieces.append(text[cursor:start])
-        pieces.append("\x01" * (end - start))
+        pieces.append(placeholder * (end - start))
         cursor = end
     pieces.append(text[cursor:])
     return "".join(pieces)

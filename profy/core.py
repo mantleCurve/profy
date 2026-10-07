@@ -1356,11 +1356,13 @@ def _tokenize(
     With ``elide`` the vowel of an elidable word is optional ("fck"), as is the
     token starting at each character index in ``optional``."""
     elidable = elide and _is_elidable(profanity)
+    # Keys are lowercase; entries may not be ("Fukah").
+    folded = _fold(profanity)
     tokens: list[_Token] = []
     i = 0
     while i < len(profanity):
         for key, options in ordered:
-            if profanity.startswith(key, i):
+            if folded.startswith(key, i):
                 tokens.append(_substitution_token(options, (elidable and key in _VOWEL_KEYS) or i in optional))
                 i += len(key)
                 break
@@ -1383,10 +1385,16 @@ def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
       next letter could also use only when one of its own follows shortly, and is
       committed through an atomic group (``(?=(...))\\N``, portable to Python 3.9);
     * a gap takes separators the next letter cannot start with, so giving one
-      back can never let the next letter match it.
+      back can never let the next letter match it;
+    * where the next letter is optional (an elided vowel) or has an option
+      starting with this letter ("tz" for German "z"), the run is read both
+      ways: once with the next letter present and spelled otherwise, so that
+      it alone decides what the run shares (the "c" run of "cccock" owns every
+      "c", as the "o" comes first; the "t" run of "kitttzler" every "t"),
+      taken only when such a spelling follows; and once as before.
 
-    Backtracking is therefore limited to an elided vowel's two-way choice and a
-    few constant-time gap retries. Letter runs are bounded and the first letter
+    Backtracking is therefore limited to an optional letter's two-way choice
+    and a few constant-time gap retries. Letter runs are bounded and the first letter
     never restarts inside its own run, so each start position costs constant
     work and a whole scan stays linear in the input length.
     """
@@ -1400,6 +1408,50 @@ def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
         groups += 1
         return f"(?=(?P<r{groups}>{body}))(?P=r{groups})"
 
+    def letter(index: int, token: _Token, follow_chars: frozenset) -> str:
+        # The run of a letter that is not the last one, and the gap after it.
+        own, shared, absorbing = _split_options(token, follow_chars, _later_chars(tokens, index))
+        # Shared characters ("*" in "fu**uck") stay in this run only when one
+        # of its own characters follows within a few positions -- and only an
+        # own character no later letter could start with ("b*bo" keeps "*" for
+        # the "o" because the next "b" may be the profanity's second "b").
+        # Runs are bounded (except the first letter's plain run, which the
+        # start guard keeps linear) so that a run reached from any start
+        # position does constant work: up to _RUN_LENGTH_LIMIT characters of
+        # one letter (one option per step for multi-character letters), and
+        # up to _RUN_STEP_LIMIT stretches of shared characters inside it.
+        own_run = own if token.multi else f"{own}{{1,{_RUN_LENGTH_LIMIT}}}"
+        if not own:
+            repeats = ""
+        elif not shared or not absorbing:
+            repeats = f"{own}{{1,{_RUN_STEP_LIMIT}}}" if token.multi else own_run
+        else:
+            lead = f"{shared}{{1,{_AMBIGUOUS_LOOKAHEAD}}}" + ("" if absorbing == own else f"(?={absorbing})")
+            if token.multi:
+                repeats = f"(?:(?:{lead})?{own}){{1,{_RUN_STEP_LIMIT}}}"
+            else:
+                repeats = f"(?:{lead})?{own_run}(?:{lead}{own_run}){{0,{_RUN_STEP_LIMIT - 1}}}"
+        # Every repeat could equally start the next letter ("ss" in "ass"),
+        # so such a run keeps one character and leaves the rest to the next
+        # -- unless a separator splits the run ("coo-on", "pimm-mel"): then it
+        # keeps everything up to that separator.
+        split_run = "" if own else _split_run_expression(token, shared, separators, follow_chars, tokens[index + 1 :])
+        if index == 0 and not token.multi:
+            # The very first character stays a plain class so the regex
+            # engine can skip ahead to candidate positions.
+            run = _options_expression(token.chars, token.multi) + _start_guard(token, own, follow_chars)
+            if repeats == own_run:
+                run += atomic(f"{own}*")
+            elif repeats:
+                run += atomic(f"(?:{repeats})?")
+            elif split_run:
+                run += atomic(split_run)
+        elif not own:
+            run = (atomic(shared) if token.multi else shared) + (atomic(split_run) if split_run else "")
+        else:
+            run = atomic(f"{repeats}|{shared}" if shared else repeats)
+        return run + _gap_expression(separators, follow_chars)
+
     for index, token in enumerate(tokens):
         if token.literal is not None:
             pieces.append(re.escape(token.literal))
@@ -1411,49 +1463,27 @@ def _tokens_expression(tokens: list[_Token], separators: Iterable[str]) -> str:
             any_option = _options_expression(token.chars, token.multi)
             piece = atomic(f"{any_option}{{1,{_RUN_STEP_LIMIT}}}") if token.multi else any_option + "+"
         else:
-            own, shared, absorbing = _split_options(token, follow_chars, _later_chars(tokens, index))
-            # Shared characters ("*" in "fu**uck") stay in this run only when one
-            # of its own characters follows within a few positions -- and only an
-            # own character no later letter could start with ("b*bo" keeps "*" for
-            # the "o" because the next "b" may be the profanity's second "b").
-            # Runs are bounded (except the first letter's plain run, which the
-            # start guard keeps linear) so that a run reached from any start
-            # position does constant work: up to _RUN_LENGTH_LIMIT characters of
-            # one letter (one option per step for multi-character letters), and
-            # up to _RUN_STEP_LIMIT stretches of shared characters inside it.
-            own_run = own if token.multi else f"{own}{{1,{_RUN_LENGTH_LIMIT}}}"
-            if not own:
-                repeats = ""
-            elif not shared or not absorbing:
-                repeats = f"{own}{{1,{_RUN_STEP_LIMIT}}}" if token.multi else own_run
-            else:
-                lead = f"{shared}{{1,{_AMBIGUOUS_LOOKAHEAD}}}" + ("" if absorbing == own else f"(?={absorbing})")
-                if token.multi:
-                    repeats = f"(?:(?:{lead})?{own}){{1,{_RUN_STEP_LIMIT}}}"
-                else:
-                    repeats = f"(?:{lead})?{own_run}(?:{lead}{own_run}){{0,{_RUN_STEP_LIMIT - 1}}}"
-            # Every repeat could equally start the next letter ("ss" in "ass"),
-            # so such a run keeps one character and leaves the rest to the next
-            # -- unless a separator splits the run ("coo-on", "pimm-mel"): then it
-            # keeps everything up to that separator.
-            split_run = "" if own else _split_run_expression(token, shared, separators, follow_chars, tokens[index + 1 :])
-            if index == 0 and not token.multi:
-                # The very first character stays a plain class so the regex
-                # engine can skip ahead to candidate positions.
-                run = _options_expression(token.chars, token.multi) + _start_guard(token, own, follow_chars)
-                if repeats == own_run:
-                    run += atomic(f"{own}*")
-                elif repeats:
-                    run += atomic(f"(?:{repeats})?")
-                elif split_run:
-                    run += atomic(split_run)
-            elif not own:
-                run = (atomic(shared) if token.multi else shared) + (atomic(split_run) if split_run else "")
-            else:
-                run = atomic(f"{repeats}|{shared}" if shared else repeats)
-            piece = run + _gap_expression(separators, follow_chars)
+            piece = letter(index, token, follow_chars)
+            # The next letter as it follows a run of this one: present, and
+            # spelled by an option that does not start with a character of
+            # this letter ("tz" for German "z" would take the last "t" of
+            # "kitttzler").
+            following = tokens[index + 1]
+            mine = {character.lower() for character in token.chars}
+            next_letter = _Token(following.chars, tuple(option for option in following.multi if option[0].lower() not in mine))
+            if (following.optional or next_letter.multi != following.multi) and (next_letter.chars or next_letter.multi):
+                present = letter(index, token, _follow_chars([token, next_letter], 0))
+                if _GROUP_NAME.sub("", present) != _GROUP_NAME.sub("", piece):
+                    # The very first character's plain class stays in front.
+                    shared_start = _options_expression(token.chars, token.multi) if index == 0 and not token.multi else ""
+                    ahead = "(?=" + _options_expression(next_letter.chars, next_letter.multi) + ")"
+                    piece = shared_start + f"(?:{present[len(shared_start):]}{ahead}|{piece[len(shared_start):]})"
         pieces.append(f"(?:{piece})?" if token.optional else piece)
     return "".join(pieces)
+
+
+# The names of the atomic groups of _tokens_expression, numbered in order.
+_GROUP_NAME = re.compile(r"(?<=\(\?P[<=]r)\d+")
 
 
 def _follow_chars(tokens: list[_Token], index: int) -> Optional[frozenset]:

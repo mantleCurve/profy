@@ -349,6 +349,22 @@ def test_normalization_scales_linearly(language, unit):
     assert_linear(shield, unit * (4000 // len(unit)), unit * (16000 // len(unit)))
 
 
+@pytest.mark.parametrize(
+    "language, unit",
+    [
+        # A run before an optional letter ("c" before the elided "o" of
+        # "cock", "s" of "sissy", "m" before "{" and the "i" of "mick") or
+        # before a letter with an option starting like it (German "t" before
+        # "tz", "s" before "sch", "c" before "ck") is read two ways.
+        *[("english", unit) for unit in ["co", "c\u00a2", "si", "b0", "m{", "mi{"]],
+        *[("german", unit) for unit in ["tz", "ttz", "s5", "ck", "po"]],
+    ],
+)
+def test_runs_read_two_ways_scale_linearly(language, unit):
+    shield = ProfanityFilter(languages=language)
+    assert_linear(shield, unit * (2000 // len(unit)), unit * (8000 // len(unit)))
+
+
 def test_block_entries_matching_bundled_text_scale_linearly():
     # Each block occurrence rebuilt an index of the selected matches: with
     # only "shit" bundled and blocked, "shit " * 8000 took ~0.9s, 3x 4000.

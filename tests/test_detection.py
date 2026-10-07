@@ -5,7 +5,7 @@ import time
 import pytest
 
 from helpers import ROOT
-from profy import Match, ProfanityFilter, Severity, ShieldResult, filter_text
+from profy import Match, ProfanityFilter, Severity, ShieldResult, core, filter_text
 
 SEPARATORS = json.loads((ROOT / "profy" / "data" / "global.json").read_text(encoding="utf-8"))["separators"]
 
@@ -641,6 +641,100 @@ def test_every_entry_repeated_is_masked_completely(language, count):
     assert failures <= KNOWN_REPEAT_FAILURES, sorted(failures - KNOWN_REPEAT_FAILURES)
 
 
+def _letter_runs(word, substitutions):
+    """(kind, text) for every letter of ``word`` stretched to 2, 3, 5 and 8
+    characters: plain, with the word's optional vowel left out ("fck"), and
+    with one substitute in the middle of the run ("cc¢cc")."""
+    forms = [("plain", word)]
+    if core._is_elidable(word):
+        vowel = next(index for index, character in enumerate(word) if character in core._VOWEL_KEYS)
+        forms.append(("elided", word[:vowel] + word[vowel + 1 :]))
+    for kind, form in forms:
+        for index, character in enumerate(form):
+            if not character.isalpha():
+                continue
+            options = [option.replace("\\", "") for option in substitutions.get(character, [])]
+            options = [option for option in options if len(option) == 1 and option != character and option != "*"]
+            substitute = ([option for option in options if not option.isalpha()] or options or [None])[0]
+            for length in (2, 3, 5, 8):
+                yield kind, form, index, length, form[:index] + character * length + form[index + 1 :]
+                if kind == "plain" and substitute:
+                    run = character * (length // 2) + substitute + character * (length - 1 - length // 2)
+                    yield "leet", form, index, length, form[:index] + run + form[index + 1 :]
+
+
+# Known failures of the sample below, by cause (the full sweep over every
+# entry outside the suite finds no other kinds):
+# * a run with a substitute where the next letter also accepts the stretched
+#   letter, as "!" is "i" and "l" ("jai!ilbait") or French "c" accepts "s"
+#   ("des5cendances"): a run only keeps characters it shares with the next
+#   letter before one of its own that no later letter starts with;
+# * Spanish "ll" and "rr", which the language reads as letters of their own;
+# * hexadecimal-looking tokens ("caa4aaca"), which are identifiers by design.
+KNOWN_RUN_FAILURES = {
+    ("english", "anilingus", "leet"),
+    ("english", "b00b", "leet"),
+    ("english", "b00b", "plain"),
+    ("english", "diligaf", "leet"),
+    ("english", "dingleberries", "leet"),
+    ("german", "eingeäschert", "leet"),
+    ("german", "eingeäschertes", "leet"),
+    ("german", "heuchlerisches", "leet"),
+    ("german", "närrische", "leet"),
+    ("german", "zerschmetterter", "leet"),
+    ("spanish", "culera", "leet"),
+    ("spanish", "culiacan", "leet"),
+    ("spanish", "culo", "leet"),
+    ("spanish", "gordinflas", "leet"),
+    ("spanish", "marrón", "leet"),
+    ("spanish", "molesto", "leet"),
+    ("spanish", "pestilencia", "leet"),
+    ("spanish", "ridiculo", "leet"),
+    ("spanish", "rompepelotas", "leet"),
+}
+
+
+@pytest.mark.parametrize(
+    "language, count, always",
+    [
+        # Each class fixed by giving runs before an optional or a
+        # multi-character letter their own reading ("cccock", "kitttzler"),
+        # and entries spelled with capitals ("Fukah").
+        ("english", 60, ["cock", "cuck", "tits", "b00b", "fukah", "fukk", "chink"]),
+        ("german", 30, ["poppt", "kitzler", "hartz", "fotze"]),
+        ("french", 30, []),
+        ("spanish", 30, []),
+    ],
+)
+def test_every_letter_of_an_entry_may_run_on(language, count, always):
+    # A seeded sample of the bundled entries, each letter stretched (see
+    # _letter_runs): every character must be masked. Doubling a letter English
+    # often doubles makes a different word unless the entry is still spelled
+    # in it ("cocck" stays, "ccock" is masked), as documented.
+    data = json.loads((ROOT / "profy" / "data" / "languages" / f"{language}.json").read_text(encoding="utf-8"))
+    global_data = json.loads((ROOT / "profy" / "data" / "global.json").read_text(encoding="utf-8"))
+    false_positives = {word.lower() for word in global_data["false_positives"] + data.get("false_positives", [])}
+    substitutions = {key.strip("/"): list(options) for key, options in global_data["substitutions"].items()}
+    for key, options in data.get("substitutions", {}).items():
+        substitutions.setdefault(key.strip("/"), []).extend(options)
+    words = sorted({word.lower() for word in data["profanities"] if word.lower() not in false_positives and " " not in word})
+    shield = ProfanityFilter(languages=language)
+    failures = set()
+    for word in always + random.Random(f"runs-{language}").sample(words, count):
+        assert shield.check(word).clean == "*" * len(word), word
+        for kind, form, index, length, text in _letter_runs(word, substitutions):
+            if kind == "elided" and shield.check(form).clean != "*" * len(form):
+                continue
+            if kind != "leet" and length == 2 and form[index] not in RARELY_DOUBLED and word not in text:
+                continue
+            if shield.check(text).clean != "*" * len(text):
+                failures.add((language, word, kind))
+    assert failures <= KNOWN_RUN_FAILURES, sorted(failures - KNOWN_RUN_FAILURES)
+    # The fixed classes stay fixed (r20 left each of these unmasked).
+    for text in {"english": ["cccock", "ccock", "cccocks", "tttits", "bbbb00b", "ffukah", "FFUKAH", "ffkk"], "german": ["ppoppt", "kitttzler", "hrtttz", "fottttttttze"]}.get(language, []):
+        assert shield.check(text).clean == "*" * len(text), text
+
+
 @pytest.mark.parametrize(
     "text, clean",
     [
@@ -724,7 +818,7 @@ def test_chains_of_abbreviations(english, text, clean):
     assert english.check(text).clean == clean
 
 
-@pytest.mark.parametrize("text", ["xsuspekty", "xsuspektery", "xpoppty", "ppoppt"])
+@pytest.mark.parametrize("text", ["xsuspekty", "xsuspektery", "xpoppty", "xppoppt"])
 def test_two_letter_entries_make_no_chain(text):
     # German "zu" and "po" are entries, but like compound parts a chain needs
     # words of three or more letters ("su|spek" inside "xsuspekty").

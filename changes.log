@@ -1,5 +1,106 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 20)
+- [P2] a stretched letter before an optional letter went undetected:
+  "cccock", "ccock" and "cccocks" stayed unmasked (main masks them).
+  - The vowel of "cock" is optional (elision), so the first "c" shared
+    every character with the "c" after the vowel. Its run could not repeat,
+    and only "cock" at the end matched, which the substring guard rejects.
+  - In `_tokens_expression`, the run of a letter whose next letter is
+    optional is now built twice. One version assumes the next letter is
+    present, so that letter alone decides what the run shares, and is
+    taken only when a lookahead sees it. The other is the old version
+    (next letter absent).
+  - Each version still gives every character one owner, and the choice
+    between them is a constant two-way choice per start position, so
+    scanning stays linear.
+  - Both versions are emitted only when they differ (atomic group names
+    ignored, `_GROUP_NAME`); every other expression is unchanged.
+- The same mechanism, through a multi-character option of the next letter:
+  German "z" may be spelled "tz", so "kitttzler", "butttze", "schmutttzig"
+  and the elided "hrtttz" (main fails these too). The "present" version
+  also leaves out the next letter's options that start with a character
+  of this letter.
+- Found by the sweep (main too): `_tokenize` matched substitution keys
+  case-sensitively, so the 9 capitalized entries ("Fukah", "Fukker",
+  "Fudge Packer", ...) got literal letters with no substitutes or runs
+  ("ffukah", "F<u#k/k" partly masked). Keys now match the folded entry.
+- Stretch sweep ($S/stretch20.py): every bundled entry, each letter
+  (first, interior, last) stretched to 2, 3, 5 and 8. Variants: plain,
+  with the optional vowel left out (when that form is itself masked), and
+  with one substitute in the middle of the run. Full masking is required.
+  - Doubles of a letter English often doubles that no longer spell the
+    entry are exempt by design ("cocck"), as are entries not masked as
+    themselves (French false positives such as "classe").
+  - Real failures, r20 -> new:
+
+    | Language | Cases | r20 | New |
+    |---|---|---|---|
+    | English | 158,304 | 279 | 159 |
+    | German | 75,584 | 454 | 380 |
+    | French | 87,600 | 41 | 41 |
+    | Spanish | 21,408 | 308 | 308 |
+
+  - Fixed: 124 English (52 also fail on main) and 74 German (73 also fail
+    on main); 0 newly failing. Exempt cases: 5,788 -> 5,784 English,
+    otherwise unchanged.
+- What remains, every case classified ($S/classify20.py):
+  - A run with a substitute where the next letter also accepts the
+    stretched letter or the substitute ("!" is "i" and "l": "jai!ilbait";
+    French "c" accepts "s": "des5cendances"; German "k" accepts "c":
+    "schrec¢klich"). Counts: 120 English, 379 German, 34 French, 3
+    Spanish.
+    - Cause: a run keeps characters it shares with the next letter only
+      before an own character that no later letter starts with (the
+      "absorbing" rule). These letters recur later in the word, so the
+      rule refuses.
+    - Not the reported class (no optional letter involved). The fix would
+      narrow the rule from "any later letter" to "the letters a bounded
+      shared run could reach", which changes many expressions and needs its
+      own linearity argument. Left as a follow-up.
+  - Spanish "ll"/"rr", which the language reads as letters of their own
+    (297).
+  - Hexadecimal-looking tokens ("caa4aaca", "bbbbb00b"), identifiers by
+    design: 22 English, 4 French, 4 Spanish.
+  - Entries with spaces (19, the classes above plus double spaces left by
+    elision).
+  - A run before a literal it spells ("masterb88": the final "8" of
+    "masterb8" is literal): 2.
+  - A letter the entry already doubles ("cockknockker"): 2.
+  - Ordinary words and false positives ("assess", "shiite"): 2.
+- Tests:
+  - `test_every_letter_of_an_entry_may_run_on`: a seeded sample of 60
+    English and 30 German, French and Spanish entries, plus the fixed
+    words, every letter stretched as in the sweep. The 19 known failures of
+    the sample are listed explicitly (all in the first three classes above).
+    r20 fails it for English and German.
+  - `test_two_letter_entries_make_no_chain`: "ppoppt" replaced by "xppoppt".
+    "ppoppt" is a stretched "poppt" (an entry), masked like "ccock" and by
+    main; r20 left it clean only because of this bug.
+  - `test_runs_read_two_ways_scale_linearly`: 11 shapes ("co", "c¢", "si",
+    "b0", "m{", "mi{"; German "tz", "ttz", "s5", "ck", "po"), at most ×4.0
+    for a 4× size step. These are guards: no snapshot was quadratic here.
+- Expressions changed vs r20 (group names ignored): 86 of 2,660 English, 54
+  of 1,540 German, 19 of 1,528 French, 4 of 428 Spanish.
+- Differential vs r20:
+  - 40 corpus runs: 28 results differ, 0 timeouts. 19 mask more. 8 only
+    attribute to another accent or case variant of the same entry with the
+    same severity and score ("gènes" for "genes", "Fukker" for "fuker").
+    One reads "F[[uk{{k" as one "Fukk" instead of "fuk" plus "cock", which
+    lowers its score from 100 to 60. None masks less.
+  - Repeat sweep: 89 German and 26 English (stretched "asscock",
+    "pickaninny" copies) fixed, 0 newly failing.
+  - Dictionary scan: 845 flagged, identical.
+- Performance vs r20 (CPU time, best of 3):
+  - Throughput, tiny checks and block filters at parity, within noise.
+  - Adversarial worst cases at parity (within ±3%).
+  - Cold build of the 4 language dictionaries 8.42s -> 8.66s (+3%).
+  - Runs before optional and multi-character letters scale ×3.9-4.0 for 4×
+    the input, within 1-5% of r20.
+- Suite: 1010 passed on 3.14 (264 s) and on 3.9 (612 s, run alongside it),
+  100% line and branch coverage. core.py 1303 -> 1316 statements, 508 ->
+  512 branches.
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 19)
 - [P2] an input "\x01" counted as an earlier match: masked text was
   replaced by "\x01", and "is this position masked" compared characters, so

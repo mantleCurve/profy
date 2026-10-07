@@ -1,5 +1,75 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 16)
+- Restructure: block entries no longer interleave with bundled detection.
+  `ProfanityFilter.dictionary` is the bundled dictionary built without the
+  block list (shared with filters without one); `ProfanityFilter.blocks`
+  holds only the block entries (cached by its own options; allow applies
+  to both; None when no entry is left). check() runs `_detect` for the
+  bundled words exactly as without a block list, then for the block
+  entries `_exact` (their own text in the visible input, every entry's
+  occurrences kept, also where entries overlap) and `_detect` with the
+  block dictionary; the mask is everything found, and `_report` gives one
+  deterministic rule: text order, longer first, among equal spans an
+  entry's own text, then a block reading, then a bundled one; each reports
+  the part of its span no earlier report holds (one holding nothing new is
+  not reported). "Block never reduces masking" holds by construction.
+  The block dictionary spells its entries as the language normalizes the
+  text, keeps the runs they need (its own shortener), and takes the
+  bundled words as compound parts (context only).
+- Deleted: the block-hit candidates and held/spare weighting
+  (`_Candidate.spare`, `_outside`, `_sizes`), the hit/reading
+  reconciliation (`_holds`, groups), the separate selection of block-only
+  words (`_Dictionary.added`), `_block_hits` (reservation and folding),
+  claims inside a pipeline (report()), `_RunShortener.fit` and `measured`,
+  per-expression `_fitted` tokens, `_compile_tokens`, `_check_literal`
+  (now `_literal`, run per dictionary), the blocked-first sort key and
+  `_Dictionary.blocked`/`added`/`bundled`. core.py 1325 -> 1223
+  statements, 540 -> 480 branches; check() 111 -> 17 statements
+  (`_detect` 82).
+- Codex pass 16 items: [P1] German `s+c+h+` retried inside every "s" run
+  (`"s" * 16000` 1.28s, x15.5): now `(?<!s)s+c+h+` (same matches); audited
+  every normalization pattern (Spanish `\bll(?=vowel)` and `r{2,}`, French
+  and German translation tables, whitespace collapse, invisible-character
+  stripping, run shortening) and every per-check `_RunIndex` pattern: all
+  succeed or fail in one linear scan. Scaling tests for 26 runs of
+  normalization trigger characters across the 4 languages. [P1] `_holds`
+  rebuilt an index per block occurrence ("shit " * 32000 with only "shit"
+  bundled and blocked: 12.9s, x13.8): deleted; 0.81s, x4.1, test added.
+  [P2] "as$*hell" with block=["$"] and [P2] "12-34-5678" with both entries
+  blocked: fixed by the restructure, tests added.
+- Compound parts are also compared in their normalized spelling (German
+  "beschaemendes" is read as "beshaemendes"; 142 German, 23 Spanish and 2
+  French parts gain a spelling): needed for the block pipeline's context
+  ("ipfe" before "beschaemendes"), and it fixes the bundled pipeline too:
+  German sweep 232 -> 226 failing texts, nothing newly failing, corpora
+  unchanged.
+- Intended behaviour change: a block word glued to a bundled word no longer
+  makes the bundled word a compound ("classocciso" with block=["class"]
+  masks only "class"; the bundled word is judged as without the block
+  list). On 4 x 200 generated block cases (r16 vs now, 2 severity levels,
+  10 texts each, $S/blockcmp.py) 14-19% mask less than r16; in an English
+  sample 347 of 350 are this case, and 3 are block words starting inside a
+  doubled letter they share with a glued bundled word ("clitorus|shiti"):
+  such a boundary reading needs a selected neighbour, which is now in the
+  other pipeline, and accepting context words instead would bring back
+  "git|tite". Never less than without the block list (strict probe: 0
+  violations in 72,000 checks).
+- Test changes: caching (the bundled dictionary is shared whatever the
+  block list; `blocks` is cached by its own options), folded "$$$"/"$$"
+  occurrences (now: every occurrence masked, reports never overlap),
+  the pattern-driver false-positive patch moves to `blocks`, the
+  shared-character test reports in text order ("!a" keeps its span).
+- Differential vs r16, all 40 corpus runs: 0 differing results (with the
+  restructure alone, before the compound spelling, also 0); sweep German
+  -6, others identical; dictionary scan identical (845). Windowed/
+  compacted vs full rescan: 0 diffs with and without block entries.
+  Throughput and tiny checks within 1% with and without block lists;
+  building a filter with a new block list 22ms -> 4-7ms (the bundled
+  dictionary is reused); adversarial worst cases equal or faster
+  ("* " * 200 all languages 0.94s -> 0.88s), distinct-hex block micro-test
+  0.42s -> 0.47s (x4.2).
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 15)
 - P2 block entries below minimum_severity suppressed reportable matches
   ("wanker" with block=["wanker"] at high: clean, "****er" without it): its

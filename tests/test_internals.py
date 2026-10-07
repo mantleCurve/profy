@@ -33,16 +33,17 @@ def _with_extra_expressions(shield, *extra):
 
 def test_a_later_match_reports_only_what_is_left_of_a_shared_character():
     # German reads "\u00e4" as "ae". The first pass selects "e#cd" (it covers
-    # more than "!ae"); the second finds "!a", whose "a" comes from the "\u00e4"
-    # the first already reported, so it reports only "!". A reading made of
-    # nothing but such a character reports nothing.
+    # more than "!ae"); the second finds "!a", whose "a" comes from the same
+    # "\u00e4": matches are reported in text order, so "e#cd" reports only what
+    # "!a" left of it. A reading made of nothing but such a character reports
+    # nothing.
     shield = _with_extra_expressions(
         ProfanityFilter(languages="german", block=["zz-shared"]),
         ("zz-x", re.compile("!ae?")),
         ("zz-y", re.compile("e#cd")),
     )
     result = _within(30, shield.check, "!\u00e4#cd")
-    assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-x", 0, 1), ("zz-y", 1, 4)]
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-x", 0, 2), ("zz-y", 2, 3)]
     assert result.clean == "*****"
     shield = _with_extra_expressions(
         ProfanityFilter(languages="german", block=["zz-shared"]), ("zz-x", re.compile("!a")), ("zz-y", re.compile("e"))

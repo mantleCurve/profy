@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -134,26 +134,115 @@ class ProfanityFilter:
         self.block = set(_coerce_words(block, "block", strip_invisible=self.driver == "regex"))
         self.mask = mask
         self.minimum_severity = _coerce_severity(minimum_severity)
-        self.dictionary = _cached_dictionary(
-            tuple(self.languages),
-            all_languages or len(self.languages) > 1,
-            tuple(sorted(self.allow)),
-            tuple(sorted(self.block)),
-            self.driver,
-        )
+        # Two pipelines: the bundled words, exactly as if there were no block
+        # list, and the explicit block entries alone; check() unites them, so
+        # a block entry never unmasks anything. Each dictionary is cached by
+        # its own options.
+        key = (tuple(self.languages), all_languages or len(self.languages) > 1, tuple(sorted(self.allow)))
+        self.dictionary = _cached_dictionary(*key, (), self.driver)
+        self.blocks = _cached_dictionary(*key, tuple(sorted(self.block)), self.driver) if self.block - self.allow else None
 
     def check(self, text: Optional[str]) -> ShieldResult:
         original = text or ""
+        dictionaries = [self.dictionary] + ([self.blocks] if self.blocks else [])
         if self.driver == "pattern":
-            return self._check_literal(original)
+            if not original:
+                return ShieldResult(original, original, (), 0)
+            found = [found for rank, dictionary in zip((2, 1), dictionaries) for found in self._literal(dictionary, original, rank)]
+            visible = original
+        else:
+            # Invisible characters are removed only from the matching
+            # representation; every span maps back to the untouched input so
+            # the output stays intact.
+            visible, visible_map = _strip_invisible_with_mapping(original)
+            if not visible:
+                return ShieldResult(original, original, (), 0)
+            found = self._detect(self.dictionary, original, visible, visible_map, 2)
+            if self.blocks:
+                found += self._exact(self.blocks, original, visible, visible_map)
+                found += self._detect(self.blocks, original, visible, visible_map, 1)
+        matches = self._report(original, found)
+        return ShieldResult(original, self._apply_masks(original, matches), tuple(matches), _score(matches, visible))
 
-        # Invisible characters are removed only from the matching representation;
-        # every span maps back to the untouched input so the output stays intact.
-        text, text_map = _strip_invisible_with_mapping(original)
-        if not text:
-            return ShieldResult(original, original, (), 0)
+    def _report(self, original: str, found: list[tuple[int, int, int, str, Severity]]) -> list[Match]:
+        """The matches to report for the found (start, end, rank, entry,
+        severity) spans of the original text, which may overlap: everything
+        found is masked, and no character is reported twice. They are taken in
+        text order, longer first, and among equal spans by rank (an explicit
+        block entry's own text, then a block entry's other readings, then the
+        bundled words'); each reports the part of its span no earlier one
+        holds, and one holding nothing new is not reported. So a match holding
+        another reports instead of it ("n!gger" for block=["!"] is "nigger"),
+        and of two overlapping partly, the later reports what is left ("!ä#"
+        read as "!a" and "e#" in German: "e#" reports "#")."""
+        matches: list[Match] = []
+        reach = 0
+        for start, end, _, base, severity in sorted(found, key=lambda item: (item[0], -item[1], item[2])):
+            start = max(start, reach)
+            if start < end:
+                reach = end
+                matches.append(Match(original[start:end], base, severity, start, end - start, ",".join(self.languages)))
+        return matches
 
-        dictionary = self.dictionary
+    def _found(
+        self, dictionary: "_Dictionary", original: str, start: int, end: int, rank: int, base: str
+    ) -> list[tuple[int, int, int, str, Severity]]:
+        """[(start, end, rank, entry, severity)] for a match of ``base`` over
+        the original characters [start, end), or [] below minimum_severity.
+        Variation selectors and tag characters belong to the character before
+        them ("❤\ufe0f"), so they are masked along with it."""
+        severity = dictionary.severity_for(base)
+        if self.minimum_severity is not None and not severity.is_at_least(self.minimum_severity):
+            return []
+        while end < len(original) and _modifies_previous(original[end]):
+            end += 1
+        return [(start, end, rank, base, severity)]
+
+    def _exact(
+        self, dictionary: "_Dictionary", original: str, text: str, text_map: list[tuple[int, int]]
+    ) -> list[tuple[int, int, int, str, Severity]]:
+        """The block entries' own occurrences in the visible input ``text``
+        (the original without invisible characters), found before language
+        normalization and run shortening can change their letters (German
+        reads "Fischh|ändler" as "Fishh..." and stretched "schhh" as "sh"). An
+        occurrence is the entry as typed (case-folded, whitespace runs
+        ignored) and not part of a longer alphanumeric token, or lies in a
+        token of nothing but the entry repeated ("1212|1212"). It skips every
+        heuristic guard. Occurrences of different entries may overlap
+        ("12-34" and "34-5678" in "12-34-5678"); one entry's are found left to
+        right."""
+        alphanumeric = _RunIndex(text, r"[^\W_]+")
+        token_roots: dict[tuple[int, int], tuple[str, int]] = {}
+
+        def is_exact(first: int, last: int, base: str) -> bool:
+            occurrence = text[first:last].lower()
+            if occurrence != base and " " in base:
+                occurrence = " ".join(occurrence.split())
+            if occurrence == base and not (
+                first and _ALPHANUMERIC.match(text, first - 1) and _ALPHANUMERIC.match(text, first)
+            ) and not (last < len(text) and _ALPHANUMERIC.match(text, last - 1) and _ALPHANUMERIC.match(text, last)):
+                return True
+            token = alphanumeric.around(first, last)
+            if token not in token_roots:
+                folded = text[token[0] : token[1]].lower()
+                token_roots[token] = (folded, _root_length(folded))
+            return _repeats(*token_roots[token], base)
+
+        return [
+            found
+            for base, literal in dictionary.block_literals
+            for occurrence in literal.finditer(text)
+            if is_exact(occurrence.start(), occurrence.end(), base)
+            for found in self._found(
+                dictionary, original, text_map[occurrence.start()][0], text_map[occurrence.end() - 1][1], 0, base
+            )
+        ]
+
+    def _detect(
+        self, dictionary: "_Dictionary", original: str, text: str, text_map: list[tuple[int, int]], rank: int
+    ) -> list[tuple[int, int, int, str, Severity]]:
+        """The matches of ``dictionary``'s entries in the visible input ``text``,
+        as (original start, end, rank, entry, severity)."""
         normalized, normalized_map = dictionary.normalize_with_mapping(text, text_map)
         normalized, normalized_map = _collapse_whitespace_with_mapping(normalized, normalized_map)
         # Runs of interchangeable characters longer than any dictionary word
@@ -165,59 +254,7 @@ class ProfanityFilter:
         blank = dictionary.blank
         # Letters of the unmasked text, for the Scunthorpe guard.
         letters = _RunIndex(normalized, r"[a-zA-Z]+")
-
-        matches: list[Match] = []
-        # Original characters already reported (several normalized characters
-        # can come from one original character; see report()).
-        claimed = bytearray(len(original))
-
-        def report(start: int, end: int, base: str, span: Optional[tuple[int, int]] = None) -> None:
-            if not self._reported(base):
-                return
-            original_start, original_end = span or _original_span(normalized_map, start, end)
-            # Variation selectors and tag characters belong to the character
-            # before them ("❤️"), so they are masked along with it.
-            while original_end < len(original) and _modifies_previous(original[original_end]):
-                original_end += 1
-            # Neighbouring readings can share an original character one
-            # normalized into several ("ssch" read as "sh" between two copies
-            # of German "schmaehliches", "ä" as "ae"): the later one reports
-            # what is left of it.
-            while original_start < original_end and claimed[original_start]:
-                original_start += 1
-            while original_start < original_end and claimed[original_end - 1]:
-                original_end -= 1
-            if original_start == original_end:
-                return
-            claimed[original_start:original_end] = b"\x01" * (original_end - original_start)
-            matches.append(
-                Match(
-                    text=original[original_start:original_end],
-                    base=base,
-                    severity=dictionary.severity_for(base),
-                    position=original_start,
-                    length=original_end - original_start,
-                    language=",".join(self.languages),
-                )
-            )
-
-        # Explicit block entries are found in the visible input, before language
-        # normalization and run shortening can change their letters (German
-        # reads "Fischh|ändler" as "Fishh..." and stretched "schhh" as "sh"),
-        # longest entry first. They skip every heuristic guard and are masked
-        # whatever the first pass selects: a selected reading holding one
-        # ("n!gger" for block=["!"]) is reported instead of it, one overlapping
-        # it partly is reported besides it. They constrain nothing else, so
-        # adding a block entry never unmasks a character. Entries below
-        # minimum_severity have no hits (their readings face the guards like
-        # any other).
-        hits = self._block_hits(text, text_map, normalized, normalized_map)
-        # What the hits cover: the first pass weighs a reading by what it
-        # covers besides them.
-        held = bytearray(len(normalized))
-        for first, last, _, _ in hits:
-            held[first:last] = b"\x01" * (last - first)
-
+        results: list[tuple[int, int, int, str, Severity]] = []
         working = normalized
         candidates: list[_Candidate] = []
         # Each expression's matches in the previous pass, and the spans that pass
@@ -314,10 +351,9 @@ class ProfanityFilter:
                         base,
                         number,
                         needs,
-                        self._reported(base),
+                        self._reported(dictionary, base),
                         len(matched) if plain else len(_NOT_ALPHANUMERIC.sub("", matched)),
                         len(matched) if plain else len(blank.sub("", matched)),
-                        self._sizes(_outside(matched, held, start)) if hits and held.find(1, start, end) != -1 else None,
                     )
                 )
 
@@ -341,116 +377,27 @@ class ProfanityFilter:
                     if not matched or (start, end) in seen or in_hex_token(start, end, matched):
                         continue
                     seen.add((start, end))
-                    readings, follows = self._readings(working, start, end, matched, base, expression, info)
+                    readings, follows = self._readings(dictionary, working, start, end, matched, base, expression, info)
                     for reading in readings:
                         evaluate(reading, base, number, info)
                     stack.extend(follows)
 
-            # The bundled words' readings are selected first. Words only the
-            # block list adds are selected among themselves next, next to
-            # those and weighed by what those leave uncovered; they are
-            # reported but not masked in the working text, so the bundled
-            # words' later passes run as without them: adding a block entry
-            # never unmasks what the bundled words mask.
-            added: list[_Candidate] = []
-            if dictionary.added:
-                added = [candidate for candidate in candidates if candidate.base.lower() in dictionary.added]
-                candidates = [candidate for candidate in candidates if candidate.base.lower() not in dictionary.added]
             selected = _select(candidates, masked)
-            spans = _merge_spans([(candidate.start, candidate.end) for candidate in selected] + [hit[:2] for hit in hits])
-            groups = [selected]
-            if added:
-                taken = held or bytearray(len(working))
-                for candidate in selected:
-                    taken[candidate.start : candidate.end] = b"\x01" * (candidate.end - candidate.start)
-
-                def beside(index: int) -> bool:
-                    return masked(index) or (0 <= index < len(working) and bool(taken[index]))
-
-                spare = (self._sizes(_outside(working[item.start : item.end], taken, item.start)) for item in added)
-                groups.append(_select([candidate._replace(spare=sizes) for candidate, sizes in zip(added, spare)], beside))
-            # Block hits first, unless a reported reading holds one and more
-            # ("n!gger" for block=["!"], "ass hole" for block=["ass"]); then
-            # the readings in text order, each reporting what is left of it.
-            # (Each group is in text order and without overlaps.)
-            for hit in hits:
-                if not any(_holds(group, hit[0], hit[1]) for group in groups):
-                    report(*hit)
-            for candidate in sorted(chain.from_iterable(groups), key=lambda item: (item.start, item.end)):
-                report(candidate.start, candidate.end, candidate.base)
+            for candidate in selected:
+                results += self._found(dictionary, original, *_original_span(normalized_map, candidate.start, candidate.end), rank, candidate.base)
+            spans = _merge_spans((candidate.start, candidate.end) for candidate in selected)
             if not spans:
                 break
             working = _mask_spans(working, spans)
             changed = spans
-            candidates, hits, held = [], [], bytearray()
+            candidates = []
 
-        matches.sort(key=lambda match: match.position)
-        return ShieldResult(original, self._apply_masks(original, matches), tuple(matches), _score(matches, text))
+        return results
 
-    def _block_hits(
-        self, text: str, text_map: list[tuple[int, int]], normalized: str, normalized_map: list[tuple[int, int]]
-    ) -> list[tuple[int, int, str, tuple[int, int]]]:
-        """The explicit block entries' own occurrences in the visible input
-        ``text`` (see check()), as (working start, working end, entry,
-        original span), disjoint and sorted, longest entry first where they
-        overlap. Entries below minimum_severity have none."""
-        dictionary = self.dictionary
-        alphanumeric: list[_RunIndex] = []
-        token_roots: dict[tuple[int, int], tuple[str, int]] = {}
-
-        def is_exact(first: int, last: int, base: str) -> bool:
-            """Whether ``text[first:last]`` is the entry ``base`` as typed
-            (case-folded, invisible characters and whitespace runs ignored) and
-            not part of a longer alphanumeric token, or lies in a token that is
-            nothing but the entry repeated ("1212|1212")."""
-            if not alphanumeric:
-                alphanumeric.append(_RunIndex(text, r"[^\W_]+"))
-            base = base.lower()
-            occurrence = text[first:last].lower()
-            if occurrence != base and " " in base:
-                occurrence = " ".join(occurrence.split())
-            if occurrence == base and not (
-                first and _ALPHANUMERIC.match(text, first - 1) and _ALPHANUMERIC.match(text, first)
-            ) and not (last < len(text) and _ALPHANUMERIC.match(text, last - 1) and _ALPHANUMERIC.match(text, last)):
-                return True
-            token = alphanumeric[0].around(first, last)
-            if token not in token_roots:
-                folded = text[token[0] : token[1]].lower()
-                token_roots[token] = (folded, _root_length(folded))
-            return _repeats(*token_roots[token], base)
-
-        found: list[tuple[int, int, str, tuple[int, int]]] = []
-        bounds: list[list[int]] = []
-        reserved = bytearray(text_map[-1][1])
-        for base, literal in dictionary.block_literals:
-            if not self._reported(base):
-                # Below minimum_severity it would never be reported, so it
-                # constrains nothing: not the selection, nor other entries.
-                continue
-            for occurrence in literal.finditer(text):
-                if not is_exact(occurrence.start(), occurrence.end(), base):
-                    continue
-                span = (text_map[occurrence.start()][0], text_map[occurrence.end() - 1][1])
-                if reserved.find(1, *span) == -1:
-                    reserved[span[0] : span[1]] = b"\x01" * (span[1] - span[0])
-                    if not bounds:
-                        bounds.extend(([item[0] for item in normalized_map], [item[1] for item in normalized_map]))
-                    first = bisect_right(bounds[1], span[0])
-                    found.append((first, max(first, bisect_left(bounds[0], span[1])), base, span))
-        hits: list[tuple[int, int, str, tuple[int, int]]] = []
-        for first, last, base, span in sorted(found):
-            if hits and first < hits[-1][1]:
-                # A shortened run folded its letters into the previous
-                # occurrence's ("$" * 9 for "$$$"): one hit stands for both,
-                # as the more severe entry.
-                start, end, entry, (left, right) = hits.pop()
-                base = max(entry, base, key=lambda word: dictionary.severity_for(word).weight)
-                first, last, span = start, max(last, end), (left, max(span[1], right))
-            hits.append((first, last, base, span))
-        return hits
 
     def _readings(
         self,
+        dictionary: "_Dictionary",
         working: str,
         start: int,
         end: int,
@@ -469,7 +416,6 @@ class ProfanityFilter:
         pedoss|oltar pedos"); and ones starting later in a run of the first
         letter. The selection chooses between them.
         """
-        dictionary = self.dictionary
         follows: list[tuple[int, int, str]] = []
 
         def given_back(last: int) -> list[int]:
@@ -497,7 +443,7 @@ class ProfanityFilter:
 
         ends: list[int] = []
         for whole in [end] + given_back(end):
-            last = self._unbled(working, start, whole, base, expression)
+            last = self._unbled(dictionary, working, start, whole, base, expression)
             if last is None:
                 continue
             ends.append(last)
@@ -549,7 +495,9 @@ class ProfanityFilter:
                 )
         return readings, follows
 
-    def _unbled(self, working: str, start: int, end: int, base: str, expression: re.Pattern[str]) -> Optional[int]:
+    def _unbled(
+        self, dictionary: "_Dictionary", working: str, start: int, end: int, base: str, expression: re.Pattern[str]
+    ) -> Optional[int]:
         """Where the reading ``working[start:end]`` of ``expression`` ends once
         kept out of the next word, or None when the bleed guards reject it.
 
@@ -560,7 +508,6 @@ class ProfanityFilter:
         "sluut,s|luut" as "sluts"), as when it only joins the ends of two
         words ("ha|ji-had|ji").
         """
-        dictionary = self.dictionary
         window, parts = dictionary.context_window, dictionary.compound_parts
         matched = working[start:end]
         if _is_spanning_word_boundary(matched, working, start, parts, window, expression, dictionary.longest_match):
@@ -583,52 +530,32 @@ class ProfanityFilter:
             return None
         return end
 
-    def _sizes(self, text: str) -> tuple[int, int]:
-        """How many letters and digits, and how many characters that spell
-        something (see _select), ``text`` holds."""
-        return len(_NOT_ALPHANUMERIC.sub("", text)), len(self.dictionary.blank.sub("", text))
-
-    def _reported(self, base: str) -> bool:
+    def _reported(self, dictionary: "_Dictionary", base: str) -> bool:
         """Whether a match of ``base`` survives minimum_severity."""
-        return self.minimum_severity is None or self.dictionary.severity_for(base).is_at_least(self.minimum_severity)
+        return self.minimum_severity is None or dictionary.severity_for(base).is_at_least(self.minimum_severity)
 
     def clean(self, text: Optional[str]) -> str:
         return self.check(text).clean
 
-    def _check_literal(self, text: str) -> ShieldResult:
-        """Port of Blasp's PatternDriver: exact, case-insensitive, word-bounded matches."""
-        if not text:
-            return ShieldResult(text, text, (), 0)
-
-        found: list[Match] = []
-        for base, expression in self.dictionary.sorted_expressions:
-            if base.lower() in self.dictionary.false_positives:
-                continue
-            for hit in expression.finditer(text):
-                found.append(
-                    Match(
-                        text=hit.group(0),
-                        base=base,
-                        severity=self.dictionary.severity_for(base),
-                        position=hit.start(),
-                        length=hit.end() - hit.start(),
-                        language=",".join(self.languages),
-                    )
-                )
-
-        # Severity filtering happens before de-duplication so a shorter,
-        # high-severity match is not swallowed by a longer filtered-out one.
-        if self.minimum_severity is not None:
-            found = [match for match in found if match.severity.is_at_least(self.minimum_severity)]
-
-        matches: list[Match] = []
+    def _literal(self, dictionary: "_Dictionary", text: str, rank: int) -> list[tuple[int, int, int, str, Severity]]:
+        """Port of Blasp's PatternDriver: exact, case-insensitive, word-bounded
+        matches of ``dictionary``'s entries, as (start, end, rank, entry,
+        severity), a match starting inside an earlier one dropped."""
+        found = [
+            (hit.start(), hit.end(), base)
+            for base, expression in dictionary.sorted_expressions
+            if base.lower() not in dictionary.false_positives
+            for hit in expression.finditer(text)
+        ]
+        matches: list[tuple[int, int, int, str, Severity]] = []
         covered_end = -1
-        for match in sorted(found, key=lambda item: (item.position, -item.length)):
-            if match.position >= covered_end:
-                matches.append(match)
-                covered_end = match.position + match.length
-
-        return ShieldResult(text, self._apply_masks(text, matches), tuple(matches), _score(matches, text))
+        for start, end, base in sorted(found, key=lambda item: (item[0], -item[1])):
+            # Severity filtering happens before de-duplication so a shorter,
+            # high-severity match is not swallowed by a longer filtered-out one.
+            if start >= covered_end and self._reported(dictionary, base):
+                matches.append((start, end, rank, base, dictionary.severity_for(base)))
+                covered_end = end
+        return matches
 
     def _apply_masks(self, text: str, matches: list[Match]) -> str:
         pieces: list[str] = []
@@ -695,6 +622,14 @@ def _cached_dictionary(
 
 
 class _Dictionary:
+    """The compiled entries of one pipeline (see ProfanityFilter): the bundled
+    words of the selected languages, or the explicit block entries alone
+    (``blocked``). A block dictionary reads its entries as the text is read,
+    spelled as the language normalizes them ("Fischhändler" as "Fishhaendler",
+    Spanish "jrrrj" as "jrj") and with the runs they need kept, finds their own
+    text as typed (``block_literals``), and takes the bundled words' compound
+    parts as context for its guards (``context``)."""
+
     def __init__(
         self,
         *,
@@ -705,8 +640,8 @@ class _Dictionary:
         separators: list[str],
         languages: list[str],
         driver: str = "regex",
-        blocked: Iterable[str] = (),
-        bundled: Iterable[str] = (),
+        blocked: bool = False,
+        context: Iterable[str] = (),
     ) -> None:
         # Instances are cached and shared between filters, so expose read-only views.
         self.profanities = tuple(profanities)
@@ -720,23 +655,38 @@ class _Dictionary:
         # The most characters one match can span: every letter a full run plus
         # a separator gap.
         self.longest_match = (self.longest_word + 1) * (_RUN_LENGTH_LIMIT + _SEPARATOR_LIMIT)
-        self.compound_parts = frozenset(word for word in self.words if len(word) >= _COMPOUND_PART_MINIMUM)
+        # Compared with the text as it is read, so as the language normalizes
+        # them too (German "beschaemendes" read as "beshaemendes").
+        parts = {word.lower() for word in chain(self.words, context)}
+        self.compound_parts = frozenset(
+            part for word in parts for part in {word, self.normalize(word).lower()} if len(part) >= _COMPOUND_PART_MINIMUM
+        )
         self.context_window = max([len(part) for part in self.compound_parts] + [_LONGEST_SUFFIX + 1])
         self.longest_false_positive = max([0] + [len(word) for word in self.false_positives])
         # Stop classes of the generated expressions (see _compile_profanity),
         # keyed by id(): hashing a compiled pattern re-hashes its whole program.
         # The expressions live as long as this dictionary, so ids stay unique.
         self.stops: dict[int, re.Pattern[str]] = {}
+        # Each explicit block entry, as typed, longest first; see ProfanityFilter._exact.
+        self.block_literals = tuple(
+            (word, re.compile(r"\s+".join(re.escape(part) for part in word.split(" ")), re.IGNORECASE | re.UNICODE))
+            for word in sorted(dict.fromkeys(profanities), key=lambda item: (-len(item), item))
+            if blocked
+        )
         variants = []
         if driver == "pattern":
             self.expressions = _generate_literal_expressions(profanities)
         else:
-            self.expressions, stops = _generate_reaching_expressions(profanities, separators, substitutions)
-            self.stops = {id(expression): stop for expression, stop in stops.items()}
-            # Runs keep at least what the language's own words need; block-list
-            # words only lengthen the runs of their own characters (a block word
-            # "x" * 300 must not keep "u" runs too long to match "fuu...ck").
+            # How each word is spelled for its expressions.
+            self._spellings = {word: self.normalize(word) for word in profanities} if blocked else {}
+            spellings = [(word, self._spellings.get(word, word)) for word in profanities]
             ordered = _ordered_substitutions(substitutions)
+            self._separators = tuple(separators)
+            self.expressions = {}
+            for word, spelling in spellings:
+                expression, stop = _compile_profanity(spelling, ordered, self._separators)
+                self.expressions[word] = expression
+                self.stops[id(expression)] = stop
             # A word spelled with a multi-letter key ("sch", "ck", "ll") also
             # gets an expression with a token per letter, so each letter of the
             # key can be obfuscated or stretched on its own ("5chwuler",
@@ -750,30 +700,22 @@ class _Dictionary:
             variants: list[tuple[str, re.Pattern[str]]] = []
             variant_tokens: list[tuple[str, tuple[_Token, ...]]] = []
             if single != ordered:
-                for word in profanities:
-                    optional = _rewritten_keys(word, rewritten)
-                    tokens = _tokenize(word, single, True, optional)
-                    if tokens != _tokenize(word, ordered):
-                        expression, stop = _compile_profanity(word, single, tuple(separators), True, optional)
+                for word, spelling in spellings:
+                    optional = _rewritten_keys(spelling, rewritten)
+                    tokens = _tokenize(spelling, single, True, optional)
+                    if tokens != _tokenize(spelling, ordered):
+                        expression, stop = _compile_profanity(spelling, single, self._separators, True, optional)
                         variants.append((word, expression))
-                        variant_tokens.append((word, tokens))
+                        variant_tokens.append((spelling, tokens))
                         self.stops[id(expression)] = stop
                         self._orderings[id(expression)] = single
                         self._optionals[id(expression)] = optional
             self._ordered = ordered
-            self._separators = tuple(separators)
             # Keyed by id() like the stop classes (the expressions live as long).
             self._infos: dict[int, _ExpressionInfo] = {}
             self._entries_by_lower: dict[str, list[str]] = {}
             for word in profanities:
                 self._entries_by_lower.setdefault(word.lower(), []).append(word)
-            # Each explicit block entry still in the dictionary (allow wins), as
-            # typed, longest first; see check().
-            self.block_literals = tuple(
-                (entry, re.compile(r"\s+".join(re.escape(part) for part in word.split(" ")), re.IGNORECASE | re.UNICODE))
-                for word in sorted(frozenset(blocked), key=lambda item: (-len(item), item))
-                for entry in self._entries_by_lower.get(word.lower(), ())[:1]
-            )
             # Separators no letter stands for ("-", ",", "_" but not "*", "!"),
             # and the reversed tail of a joined match (see _joined_word_cut).
             substitutes = {
@@ -791,69 +733,21 @@ class _Dictionary:
             )
             # What a match covers but that spells nothing (see _select).
             self.blank = re.compile(r"[\s" + members + "]+")
-            # Every word's letters are runs that can be shortened, but explicit
-            # block entries are found as typed before normalization (see
-            # check()), so only the bundled words decide how long a run stays:
-            # a block word "u" * 100 must not keep "u" runs longer than
-            # "fuu...ck" can match.
-            measured = {word.lower() for word in bundled}
+            # Runs keep what this dictionary's own words need: a block word
+            # "u" * 100 keeps "u" runs long in the block pipeline only.
             self.runs = _RunShortener(
-                [(word, _tokenize(word, ordered)) for word in profanities] + variant_tokens,
+                [(spelling, _tokenize(spelling, ordered)) for _, spelling in spellings] + variant_tokens,
                 separators,
-                _longest_needed_run(bundled, substitutions),
-                measured,
+                _longest_needed_run([spelling for _, spelling in spellings], substitutions),
             )
-            # The other words (explicit block entries) are read as the text is:
-            # normalized like it, with runs of their letters as shortening
-            # leaves them ("z" + "o" * 10 + "q" obfuscated as "z-" + "o" * 10 +
-            # "q", Spanish "j" + "r" * 11 + "j" as "j-r..."). Their own text is
-            # found as typed (see check()). Per such word its normalized
-            # spelling, and per such expression its tokens and those without
-            # the vowel left out (see _tokens).
-            self._spellings: dict[str, str] = {}
-            self._fitted: dict[int, tuple[tuple[_Token, ...], tuple[_Token, ...]]] = {}
-            added = [word for word in profanities if word.lower() not in measured]
-            # Per-expression data is keyed by id(): the replaced expressions'
-            # entries go, so a later object reusing an id finds none.
-            replaced = [variant for word, variant in variants if word.lower() not in measured]
-            replaced += [self.expressions[word] for word in added]
-            for expression in replaced:
-                for table in (self.stops, self._orderings, self._optionals):
-                    table.pop(id(expression), None)
-            variants = [(word, variant) for word, variant in variants if word.lower() in measured]
-            for word in added:
-                spelling = self.normalize(word)
-                self._spellings[word] = spelling
-                for ordering, optional in [(ordered, ())] + ([(single, _rewritten_keys(spelling, rewritten))] if single != ordered else []):
-                    tokens = _tokenize(spelling, ordering, True, optional)
-                    if ordering is not ordered and tokens == _tokenize(spelling, ordered):
-                        continue
-                    expression, stop = _compile_tokens(self.runs.fit(tokens), self._separators)
-                    if ordering is ordered:
-                        self.expressions[word] = expression
-                    else:
-                        variants.append((word, expression))
-                    self.stops[id(expression)] = stop
-                    self._orderings[id(expression)] = ordering
-                    self._optionals[id(expression)] = optional
-                    self._fitted[id(expression)] = (
-                        self.runs.fit(tokens),
-                        self.runs.fit(_tokenize(spelling, ordering, False, optional)),
-                    )
-        # Longest first; among equally long words an explicitly blocked one goes
-        # first, so it always matches its own text ("*6zy" before "fagz").
-        blocked = frozenset(blocked)
-        self.blocked = blocked
-        # Explicit block entries that are no bundled word (see check()).
-        self.added = frozenset(word.lower() for word in blocked) - {word.lower() for word in bundled}
-        # A word's per-letter variant goes before its expression with
-        # multi-letter keys: it reads every spelling the other reads in the
+        # Longest first. A word's per-letter variant goes before its expression
+        # with multi-letter keys: it reads every spelling the other reads in the
         # normalized text, and more ("5cheiss" whole, not "5|cheiss").
         variant_ids = {id(expression) for _, expression in variants}
         self.sorted_expressions = tuple(
             sorted(
                 list(self.expressions.items()) + (variants if driver != "pattern" else []),
-                key=lambda item: (len(item[0]), item[0] in blocked, id(item[1]) in variant_ids),
+                key=lambda item: (len(item[0]), id(item[1]) in variant_ids),
                 reverse=True,
             )
         )
@@ -868,6 +762,8 @@ class _Dictionary:
         block: Iterable[str] = (),
         driver: str = "regex",
     ) -> "_Dictionary":
+        """The bundled dictionary of ``languages``, or with ``block`` the block
+        dictionary of those entries (``allow`` applies to both)."""
         global_data = _load_json("global.json")
         profanities: list[str] = []
         false_positives = {item.lower() for item in global_data.get("false_positives", [])}
@@ -895,38 +791,31 @@ class _Dictionary:
                     if value not in existing:
                         existing.append(value)
 
-        known = {word.lower() for word in profanities}
-        bundled = [word for word in profanities if word.lower() not in allow]
-        for word in block:
-            # Like Blasp, only words new to the dictionary default to HIGH; blocking
-            # an existing word keeps its curated severity. An explicit block also
-            # overrides a bundled false positive for the same word.
-            if word not in known:
-                profanities.append(word)
-                known.add(word)
-                severity_map[word] = Severity.HIGH
-            false_positives.discard(word)
-
-        profanities = list(dict.fromkeys(word for word in profanities if word.lower() not in allow))
+        bundled = list(dict.fromkeys(word for word in profanities if word.lower() not in allow))
+        block = [word for word in dict.fromkeys(block) if word.lower() not in allow]
+        if block:
+            # Like Blasp, only words new to the dictionary default to HIGH;
+            # blocking an existing word keeps its curated severity. An explicit
+            # block also overrides a bundled false positive for the same word.
+            severity_map = {word: severity_map.get(word.lower(), Severity.HIGH) for word in block}
+            false_positives.difference_update(block)
         return cls(
-            profanities=profanities,
+            profanities=block or bundled,
             false_positives=false_positives,
             severity_map=severity_map,
             substitutions=substitutions,
             separators=global_data.get("separators", []),
             languages=languages,
             driver=driver,
-            blocked=block,
-            bundled=bundled,
+            blocked=bool(block),
+            context=bundled if block else (),
         )
 
     def _tokens(self, word: str, expression: re.Pattern[str], elide: bool) -> tuple[_Token, ...]:
         """The tokens ``expression`` (one of ``word``'s) was built from, or
         would be without the vowel left out."""
-        if id(expression) in self._fitted:
-            return self._fitted[id(expression)][0 if elide else 1]
         ordering, optional = self._orderings.get(id(expression), self._ordered), self._optionals.get(id(expression), ())
-        return _tokenize(word, ordering, elide, optional)
+        return _tokenize(self._spellings.get(word, word), ordering, elide, optional)
 
     def info(self, word: str, expression: re.Pattern[str]) -> "_ExpressionInfo":
         """What the scan needs to know about ``expression`` (one of ``word``'s),
@@ -959,7 +848,8 @@ class _Dictionary:
                 # Positions besides the vowel ("ck" in German "sack" is one),
                 # the characters spelling a letter, and the expression with the
                 # vowel required.
-                unelided = _compile_tokens(self._tokens(word, expression, False), self._separators)[0]
+                ordering, optional = self._orderings.get(id(expression), self._ordered), self._optionals.get(id(expression), ())
+                unelided = _compile_profanity(self._spellings.get(word, word), ordering, self._separators, False, optional)[0]
                 elision = (sum(1 for token in tokens if not token.optional), _spelling_characters(tokens), unelided)
             info = _ExpressionInfo(first, wildcards, elision, first_run, last_letter)
             self._infos[id(expression)] = info
@@ -1009,7 +899,9 @@ class _Dictionary:
                 normalized,
                 span_map,
                 # Stretched too ("sschhh"), so a doubled letter is no new word.
-                r"s+c+h+",
+                # Only from the first "s" of a run: a start inside the run reads
+                # the same rest and fails the same way ("s" * n was quadratic).
+                r"(?<!s)s+c+h+",
                 lambda match: _case_like(match.group(0), "sh"),
             )
         elif self.languages == ["french"]:
@@ -1098,8 +990,7 @@ class _RunShortener:
     characters that also occur as literals the kept length is congruent to
     the run length modulo every literal run of them ("00" in "b00bs") and the
     cut starts a multiple of it into the run, so complete occurrences stay
-    complete. Run lengths and literal runs only count for the ``measured``
-    words (default: all); the others only contribute their letters.
+    complete.
     """
 
     def __init__(
@@ -1107,7 +998,6 @@ class _RunShortener:
         tokenized: list[tuple[str, tuple[_Token, ...]]],
         separators: Iterable[str],
         floor: int,
-        measured: Optional[Container[str]] = None,
     ) -> None:
         classes: set[frozenset] = set()
         literals: set[str] = set()
@@ -1153,9 +1043,6 @@ class _RunShortener:
         needed: dict[str, int] = {}
         periods: dict[str, int] = {}
         for word, tokens in tokenized:
-            if measured is not None and word.lower() not in measured:
-                # Its letters are runs, but not its run lengths (see above).
-                continue
             repeats = list(_REPEATED.finditer(word.translate(table)))
             for repeat in repeats:
                 needed[repeat.group(1)] = max(needed.get(repeat.group(1), 0), len(repeat.group(0)))
@@ -1209,25 +1096,6 @@ class _RunShortener:
         if _HEX_CHARACTER.match(character):
             keep = max(keep, _HEX_TOKEN_MINIMUM)
         return keep, keep + period - 1
-
-    def fit(self, tokens: tuple[_Token, ...]) -> tuple[_Token, ...]:
-        """``tokens`` with every run of one letter longer than shortening
-        leaves cut to what it leaves (the shortest of its characters' kept
-        runs), the last of them reading on, so the expression matches the
-        shortened text of any run at least that long. For the words whose run
-        lengths shortening does not keep (explicit block entries, see
-        _Dictionary): "z" + "o" * 10 + "q" read as "z" + "o" * 7 + "o*q"."""
-        fitted: list[_Token] = []
-        for token, group in groupby(tokens):
-            size = sum(1 for _ in group)
-            kept = [self.retained(character)[0] for character in (token.chars or {token.literal or ""}) if character]
-            limit = min([keep for keep in kept if keep] or [size])
-            if size <= limit:
-                fitted.extend([token] * size)
-            else:
-                # A class token repeats; a literal one only matches once.
-                fitted.extend([token._replace(chars=token.chars or frozenset({token.literal}), literal=None)] * limit)
-        return tuple(fitted)
 
     def shorten(self, text: str, span_map: list[tuple[int, int]]) -> tuple[str, list[tuple[int, int]]]:
         # Runs are found on a copy where interchangeable characters are equal.
@@ -1364,12 +1232,7 @@ def _compile_profanity(
     is the first stop character at or after ``p``. The confirming passes rely
     on this to rescan only where masking changed the text.
     """
-    return _compile_tokens(_tokenize(profanity, ordered, elide, optional), separators)
-
-
-@lru_cache(maxsize=16384)
-def _compile_tokens(tokens: tuple[_Token, ...], separators: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]]:
-    """``_compile_profanity`` for the tokens of a profanity."""
+    tokens = _tokenize(profanity, ordered, elide, optional)
     readable: set[str] = set(separators)
     for token in tokens:
         readable.update(token.chars)
@@ -1699,12 +1562,11 @@ class _Reading(NamedTuple):
 
 
 class _Candidate(NamedTuple):
-    """One reading of a pass (see ProfanityFilter.check): its span in the
-    working text, entry, expression number, the sides that must touch another match (alternatives, see
-    ``_chain_needs``), whether it would be reported (minimum_severity), how
-    many letters and digits and how many characters that spell something it
-    covers (see ``_select``), and the same for what it covers besides text a
-    selection outside it already masks (None: all of it)."""
+    """One reading of a pass (see ProfanityFilter._detect): its span in the
+    working text, entry, expression number, the sides that must touch another
+    match (alternatives, see ``_chain_needs``), whether it would be reported
+    (minimum_severity), and how many letters and digits and how many
+    characters that spell something it covers (see ``_select``)."""
 
     start: int
     end: int
@@ -1714,7 +1576,6 @@ class _Candidate(NamedTuple):
     reported: bool
     letters: int
     visible: int
-    spare: Optional[tuple[int, int]] = None
 
 
 _UNCONDITIONAL = ((False, False),)
@@ -1722,7 +1583,6 @@ _UNCONDITIONAL = ((False, False),)
 # every component's total stays below half of it (start offsets sum to at most
 # the square of the length), so one integer orders scores lexicographically.
 _SCALE = 1 << 64
-_SCALE4 = _SCALE**4
 
 
 def _select(candidates: list[_Candidate], masked: Callable[[int], bool]) -> list[_Candidate]:
@@ -1749,10 +1609,7 @@ def _select(candidates: list[_Candidate], masked: Callable[[int], bool]) -> list
     5. the earliest candidates (smallest sum of start offsets).
 
     Letters and digits come first so that a reading covering one more
-    letter-like symbol does not beat one covering more letters. A candidate
-    with ``spare`` sizes (it overlaps text that is masked anyway, such as an
-    explicit block entry's own text) is first weighed by those, then by its
-    full ones.
+    letter-like symbol does not beat one covering more letters.
 
     Dynamic programming over the candidates sorted by start. A state at a
     position has two bits: a chosen supporter ends there (1), and the chosen
@@ -1786,12 +1643,7 @@ def _select(candidates: list[_Candidate], masked: Callable[[int], bool]) -> list
         for candidate in starting.get(position, ()):
             supports = candidate.needs == _UNCONDITIONAL or len(candidate.base) >= _COMPOUND_PART_MINIMUM
             letters, visible, reported = candidate.letters, candidate.visible, candidate.reported
-            full = ((letters * reported * _SCALE + letters) * _SCALE + visible * reported) * _SCALE + visible
-            spare = full
-            if candidate.spare is not None:
-                letters, visible = candidate.spare
-                spare = ((letters * reported * _SCALE + letters) * _SCALE + visible * reported) * _SCALE + visible
-            weight = (((spare * _SCALE4 + full) * _SCALE - 1) * _SCALE - candidate.order) * _SCALE - position
+            weight = (((((letters * reported * _SCALE + letters) * _SCALE + visible * reported) * _SCALE + visible) * _SCALE - 1) * _SCALE - candidate.order) * _SCALE - position
             for need_before, need_after in candidate.needs:
                 into = 2 * (need_after and not masked(candidate.end)) + supports
                 for state in (0, 1, 2, 3) if supports else (0, 1):
@@ -1944,25 +1796,6 @@ class _CandidateFinder:
                 found.append((match.start(), match.end(), match.group(0)))
                 position = max(position, match.end())
         return found
-
-
-def _holds(selected: list[_Candidate], start: int, end: int) -> bool:
-    """Whether a reported candidate of ``selected`` (in text order, without
-    overlaps) covers [start, end) and more."""
-    index = bisect_right([candidate.start for candidate in selected], start) - 1
-    holder = selected[index] if index >= 0 else None
-    return (
-        holder is not None
-        and holder.reported
-        and holder.start <= start < end <= holder.end
-        and (holder.start, holder.end) != (start, end)
-    )
-
-
-def _outside(text: str, held: Union[bytes, bytearray], start: int) -> str:
-    """The characters of ``text`` (found at ``start``) that ``held`` does not
-    mark."""
-    return "".join(character for character, inside in zip(text, held[start : start + len(text)]) if not inside)
 
 
 def _merge_spans(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:

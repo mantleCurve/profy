@@ -333,11 +333,45 @@ def test_split_readings_stay_linear_without_run_shortening(block, make):
     # The splits tried inside a run are bounded by themselves, not by the run
     # shortener: with shortening switched off, "x" * 8000 + "-z" took ~0.9s.
     shield = _block_only(block) if block else ProfanityFilter()
-    dictionary = copy.copy(shield.dictionary)
-    dictionary.runs = _KeepRuns()
-    shield.dictionary = dictionary
+    for name in ("dictionary", "blocks"):
+        if getattr(shield, name) is not None:
+            dictionary = copy.copy(getattr(shield, name))
+            dictionary.runs = _KeepRuns()
+            setattr(shield, name, dictionary)
     small = _best_of_two(shield, make(2000))
     large = _best_of_two(shield, make(8000))
     assert shield.check(make(8000)).clean.startswith("*" * 100)
     assert large < 5.0, large
     assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+
+
+@pytest.mark.parametrize(
+    "language, unit",
+    [
+        # Every character a normalization rewrites, and runs that almost make
+        # its pattern: German "s+c+h+" retried inside every "s" run ("s" * 32000
+        # took ~5s), Spanish "ll" before a vowel and "r" runs, accents.
+        *[("german", unit) for unit in ["s", "c", "h", "sc", "ssc", "sch", "ä", "ß", "S", "sS"]],
+        *[("spanish", unit) for unit in ["l", "r", "ll", "lla", "rR", "á", "ñ", "L"]],
+        *[("french", unit) for unit in ["é", "œ", "ç", "e"]],
+        *[("english", unit) for unit in ["s", " ", "\u200b", "\u200bs"]],
+    ],
+)
+def test_normalization_scales_linearly(language, unit):
+    shield = ProfanityFilter(languages=language)
+    small = _best_of_two(shield, unit * (4000 // len(unit)))
+    large = _best_of_two(shield, unit * (16000 // len(unit)))
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < QUADRATIC_LIMIT, (small, large)
+
+
+def test_block_entries_matching_bundled_text_scale_linearly():
+    # Each block occurrence rebuilt an index of the selected matches: with
+    # only "shit" bundled and blocked, "shit " * 8000 took ~0.9s, 3x 4000.
+    data = json.loads((ROOT / "profy" / "data" / "languages" / "english.json").read_text(encoding="utf-8"))
+    shield = ProfanityFilter(allow=[word for word in data["profanities"] if word.lower() != "shit"], block=["shit"])
+    small = _best_of_two(shield, "shit " * 8000)
+    large = _best_of_two(shield, "shit " * 32000)
+    assert shield.check("shit " * 100).clean == "**** " * 100
+    assert large < 5.0, large
+    assert large / max(small, 0.02) < 9, (small, large)

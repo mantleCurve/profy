@@ -363,24 +363,28 @@ def test_runs_of_a_repeated_unit_block_word_are_masked_completely(english, unit)
                 assert bundled.check(text).clean == "*" * len(text), (word, count)
 
 
-def test_block_occurrences_a_shortened_run_folds_together_are_one_match():
-    # "$" * 14 keeps fewer characters for matching, so the occurrences from
-    # offset 6 on ("$$$", "$$$", "$$") share letters: one match stands for
-    # them, as the most severe entry. Entries below minimum_severity have no
-    # occurrences, so they take nothing from those above it.
-    def shield(**options):
-        shield = ProfanityFilter(block=["$$$", "$$"], **options)
-        dictionary = copy.copy(shield.dictionary)
-        dictionary.severity_map = {**shield.dictionary.severity_map, "$$": Severity.EXTREME, "$$$": Severity.MILD}
-        shield.dictionary = dictionary
-        return shield
+def test_overlapping_occurrences_of_block_entries_are_all_masked():
+    # Occurrences of different entries may overlap: each is masked, and the
+    # reports never share a character (a later one reports what is left).
+    # "12-34" used to take its letters from "34-5678" ("12-*******").
+    def check(text, block, **options):
+        result = filter_text(text, block=block, **options)
+        spans = [(match.position, match.position + match.length) for match in result.matches]
+        assert all(end <= start for (_, end), (start, _) in zip(spans, spans[1:])), spans
+        return result
 
-    result = shield().check("$" * 14)
+    assert check("12-34-5678", ["12-34", "34-5678"]).clean == "*" * 10
+    assert check("12-34-5678", ["12-34"]).clean == "*****-5678"
+    result = check("$" * 14, ["$$$", "$$"])
+    assert result.clean == "*" * 14 and {match.base for match in result.matches} == {"$$$", "$$"}
+    # Entries below minimum_severity have no occurrences at all.
+    shield = ProfanityFilter(block=["$$$", "$$"], minimum_severity="extreme")
+    blocks = copy.copy(shield.blocks)
+    blocks.severity_map = {**shield.blocks.severity_map, "$$": Severity.EXTREME, "$$$": Severity.MILD}
+    shield.blocks = blocks
+    result = shield.check("$" * 14)
     assert result.clean == "*" * 14
-    assert [(match.base, match.position, match.length) for match in result.matches] == [("$$$", 0, 3), ("$$$", 3, 3), ("$$", 6, 8)]
-    result = shield(minimum_severity="extreme").check("$" * 14)
-    assert result.clean == "*" * 14
-    assert [(match.base, match.position, match.length) for match in result.matches] == [("$$", 0, 2), ("$$", 2, 2), ("$$", 4, 2), ("$$", 6, 8)]
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("$$", index, 2) for index in range(0, 14, 2)]
 
 
 def test_runs_of_a_repeated_block_word_keep_their_incomplete_rest():
@@ -635,11 +639,11 @@ def test_pattern_driver_respects_allow_block_and_false_positives():
 
 def test_pattern_driver_skips_profanities_listed_as_false_positives(monkeypatch):
     shield = ProfanityFilter(driver="pattern", block=["zork"])
-    dictionary = shield.dictionary
+    dictionary = shield.blocks
     patched = core._Dictionary.__new__(core._Dictionary)
     patched.__dict__.update(dictionary.__dict__)
     patched.false_positives = dictionary.false_positives | {"zork"}
-    shield.dictionary = patched
+    shield.blocks = patched
     assert shield.check("zork shit").clean == "zork ****"
 
 
@@ -658,8 +662,12 @@ def test_unknown_driver_raises():
 
 def test_filters_with_equal_options_share_one_compiled_dictionary():
     assert ProfanityFilter().dictionary is ProfanityFilter(languages="English").dictionary
-    assert ProfanityFilter(block=["a", "b"]).dictionary is ProfanityFilter(block=["B", " a "]).dictionary
-    assert ProfanityFilter(block=["zzz"]).dictionary is not ProfanityFilter().dictionary
+    # The bundled dictionary is the same whatever the block list; block
+    # entries get a dictionary of their own, cached by its options.
+    assert ProfanityFilter(block=["zzz"]).dictionary is ProfanityFilter().dictionary
+    assert ProfanityFilter(block=["a", "b"]).blocks is ProfanityFilter(block=["B", " a "]).blocks
+    assert ProfanityFilter(block=["zzz"]).blocks is not ProfanityFilter(block=["zzy"]).blocks
+    assert ProfanityFilter().blocks is None and ProfanityFilter(block=["ship"], allow=["ship"]).blocks is None
     assert ProfanityFilter(driver="pattern").dictionary is not ProfanityFilter().dictionary
 
 

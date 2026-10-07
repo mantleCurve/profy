@@ -528,6 +528,83 @@ def test_a_block_entry_never_unmasks_anything(text, block, options):
         assert _masked(without) <= _masked(with_block), (level, without.clean, with_block.clean)
 
 
+def _view(result):
+    # Masked characters, and the severity reported for each.
+    severities = {
+        index: match.severity.weight for match in result.matches for index in range(match.position, match.position + match.length)
+    }
+    return _masked(result), severities
+
+
+@pytest.mark.parametrize(
+    "text, block, extra, options",
+    [
+        # Selecting among block readings dropped "yz" for "xy".
+        ("x-y-z", ["yz"], "xy", {}),
+        # The pattern driver dropped the second of two overlapping occurrences.
+        ("12-34-5678", ["34-5678"], "12-34", {"driver": "pattern"}),
+        # The block entry's report replaced the extreme bundled "nigger".
+        ("n!gger", [], "n!gger", {}),
+        ("n!gger", ["nig"], "n!gger", {"driver": "pattern"}),
+        # Another entry spelling the word before a separator dropped this
+        # entry's reading through it ("stupide-s" of "stupides").
+        ("stupide-stupides-stupides", ["stupides"], "stupide", {"languages": "french"}),
+        ("doofe-se-b\u00f6ses-doofes", ["se", "b\u00f6ses", "doofes"], "doofe", {"languages": "german"}),
+    ],
+)
+def test_another_block_entry_never_lowers_masking_severity_or_score(text, block, extra, options):
+    for level in SEVERITY_LEVELS:
+        before = filter_text(text, block=block, minimum_severity=level, **options)
+        after = filter_text(text, block=block + [extra], minimum_severity=level, **options)
+        (masked, severities), (masked_after, severities_after) = _view(before), _view(after)
+        assert masked <= masked_after, (level, before.clean, after.clean)
+        assert all(severities_after.get(index, 0) >= weight for index, weight in severities.items()), level
+        assert after.score >= before.score, (level, before.score, after.score)
+    assert filter_text("n!gger", block=["n!gger"]).severity is Severity.EXTREME
+    assert filter_text("n!gger", block=["n!gger"]).score == filter_text("n!gger").score == 100
+
+
+@pytest.mark.parametrize("language, count", [("english", 12), ("german", 5), ("french", 5), ("spanish", 5)])
+def test_adding_to_a_block_list_never_reduces_masking_severity_or_score(language, count):
+    # For base block lists of 0-4 words and one more: what is masked, the
+    # severity reported for each masked character and the score never go
+    # down, with both drivers and at every minimum_severity. Words: bundled
+    # entries, parts and extensions of them, an obfuscated form ("n!gger"),
+    # and pieces that overlap when joined ("x-y-z" for "xy" and "yz").
+    data = json.loads((ROOT / "profy" / "data" / "languages" / f"{language}.json").read_text(encoding="utf-8"))
+    rng = random.Random(f"block-list-{language}")
+    entries = sorted({word.lower() for word in data["profanities"] if word.isalpha() and len(word) >= 4})
+    ordinary = ["hello", "class", "shell", "xy", "yz", "12-34", "34-5678", "n!gger", "$", "!"]
+
+    def variant(word):
+        middle = len(word) // 2
+        return rng.choice(
+            [word, word[: max(2, len(word) - 2)], word[2:], "x" + word, word + "s", word[:middle] + "!" + word[middle + 1 :], rng.choice(ordinary)]
+        )
+
+    for _ in range(count):
+        words = [rng.choice(entries) for _ in range(3)]
+        base = [variant(rng.choice(words)) for _ in range(rng.randint(0, 4))]
+        extra = variant(rng.choice(words))
+        texts = [
+            f"oh {extra}, {words[0]}!",
+            extra + words[0],
+            "-".join([extra] + base + [words[1]]),
+            "".join(base + [extra]),
+            "x-y-z 12-34-5678 n!gger " + extra,
+            words[0][:-1] + "-" + extra,
+        ]
+        for driver in ("regex", "pattern"):
+            for level in SEVERITY_LEVELS:
+                before = ProfanityFilter(languages=language, minimum_severity=level, block=base, driver=driver)
+                after = ProfanityFilter(languages=language, minimum_severity=level, block=base + [extra], driver=driver)
+                for text in texts:
+                    (masked, severities), (masked_after, severities_after) = _view(before.check(text)), _view(after.check(text))
+                    assert masked <= masked_after, (driver, level, base, extra, text)
+                    assert all(severities_after.get(index, 0) >= weight for index, weight in severities.items()), (driver, level, base, extra, text)
+                    assert after.check(text).score >= before.check(text).score, (driver, level, base, extra, text)
+
+
 @pytest.mark.parametrize("language, count", [("english", 25), ("german", 10), ("french", 10), ("spanish", 10)])
 def test_adding_a_block_entry_never_reduces_masking(language, count):
     # For any text, options and block word: what is masked with block=[word]

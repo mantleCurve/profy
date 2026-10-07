@@ -235,9 +235,8 @@ def test_hex_tokens(token, verdict):
 
 
 def test_score_is_capped():
-    matches = [core.Match("x", "x", core.Severity.EXTREME, 0, 1)] * 5
-    assert core._score(matches, "x") == 100
-    assert core._score([], "anything") == 0
+    assert core._score([core.Severity.EXTREME], [5], "x") == 100
+    assert core._score([], [], "anything") == 0
 
 
 @pytest.mark.parametrize(
@@ -428,6 +427,39 @@ def test_select_needs_supporters_of_three_letters():
         (0, 2, "zu"),
         (2, 6, "speck"),
     ]
+
+
+def test_supported_keeps_every_candidate_that_holds():
+    never = lambda index: False  # noqa: E731
+    masked = lambda index: index in {20}  # noqa: E731
+    either = ((True, False), (False, True))
+    candidates = [
+        _candidate(0, 3, "aaa", _alone(False, True)),  # held by its right neighbour
+        _candidate(3, 6, "bbb", _alone(True, False)),
+        _candidate(3, 5, "fff", _alone(True, False)),  # overlaps "bbb": kept too
+        _candidate(10, 13, "ccc", _alone(True, False)),  # no left neighbour
+        _candidate(13, 16, "ddd", _alone(True, False)),  # leans on "ccc", which does not hold
+        _candidate(17, 20, "eee", _alone(False, True)),  # touches a masked character
+        _candidate(30, 34, "xxxx"),  # needs nothing; overlapping readings stay
+        _candidate(32, 36, "yyyy"),
+    ]
+    assert _spans(core._supported(candidates, masked)) == [
+        (0, 3, "aaa"), (3, 5, "fff"), (3, 6, "bbb"), (17, 20, "eee"), (30, 34, "xxxx"), (32, 36, "yyyy")
+    ]
+    # A two-letter candidate that needs a neighbour holds but supports nothing.
+    assert _spans(core._supported([_candidate(0, 2, "zu", either), _candidate(2, 6, "speck", either), _candidate(6, 9, "xyz")], never)) == [
+        (0, 2, "zu"),
+        (2, 6, "speck"),
+        (6, 9, "xyz"),
+    ]
+    assert core._supported([_candidate(0, 2, "zu", either), _candidate(2, 6, "speck", either)], never) == []
+    assert _spans(core._supported([_candidate(2, 4, "po", _alone(True, False)), _candidate(0, 2, "abc")], never)) == [
+        (0, 2, "abc"),
+        (2, 4, "po"),
+    ]
+    # A two-letter candidate that falls supported nothing; a chain falls link
+    # by link once its anchor goes.
+    assert core._supported([_candidate(0, 2, "zu", _alone(True, False)), _candidate(2, 5, "abc", _alone(True, False))], never) == []
 
 
 def test_select_tie_breaks():

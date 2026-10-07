@@ -1,5 +1,49 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 17)
+- [P2] one block entry unmasked another's reading ("x-y-z": block=["yz"]
+  "x-***", with "xy" "***-z"): the block pipeline selected among all
+  entries' readings and its masks blocked the rest in later passes. Each
+  entry is now detected on its own (`_Dictionary.entries`: its expressions
+  and its own run shortener; the normalized text computed once), and every
+  reading that holds is masked (`_supported`: the largest set in which each
+  reading needing a neighbour has one, by support counting, like the old
+  chain resolution; overlapping readings all stay). Other entries only
+  count as compound parts and remove false positives, which never makes a
+  guard stricter; the bleed guard's "another entry spells it" rule and the
+  prefix entries consider the entry alone (`_unbled(alone=True)`):
+  "stupides" lost "stupide-s" once "stupide" was blocked too.
+- [P2] pattern driver: block entries keep every occurrence
+  (`_literal(deduplicate=False)`); the bundled ones keep upstream's
+  deduplication.
+- [P2] severity/score: every reported match takes the highest severity of
+  its region (findings connected by overlaps; more findings only join
+  regions), and `_score` counts the distinct spans found with their region's
+  severity (more findings only add spans or raise them). "n!gger" with
+  block=["n!gger"]: extreme, score 100 (was high, 60).
+- Properties (both drivers, every minimum_severity, base lists of 0-4
+  words plus one): masking, each masked character's severity and the score
+  never go down. Probe ($S/blockmono17.py, 4 languages): r17 121 violations
+  in 52,800 checks; final code 0 in 440,000. Suite: regression cases (the
+  three findings, "stupides", "doofe") and a seeded property test that r17
+  fails.
+- Cost of detecting each entry on its own: an exact prefilter skips an
+  entry when one of its non-optional letters (with case variants, "ſ" for
+  "s") is absent from the text, and run indexes are built on first lookup.
+  With 200 block words (dictionary words): prose 1.30s -> 1.42s (+9%), with
+  50: +1%, tiny checks within 15%; building a filter with 200 new block words
+  7ms -> 116ms (once, cached). Without block entries: throughput, tiny checks
+  and adversarial worst cases at parity; "shit " * 32000 with a one-word
+  filter -3%; 64k "12" block hits in one token 0.20s -> 0.21s.
+  `Severity.weight` no longer builds a dict per call.
+- Differential vs r17, all 40 corpus runs, comparing masks, matches with
+  their severities, and scores: 0 differing results. Windowed/compacted vs
+  full rescan: 0 diffs with 21 block entries. Sweep and dictionary scan
+  identical.
+- Test changes: `_score` takes (severities, counts); `_supported` unit test.
+- core.py 1223 -> 1285 statements, 480 -> 502 branches (`_supported`,
+  per-entry block dictionaries, regions, prefilter).
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 16)
 - Restructure: block entries no longer interleave with bundled detection.
   `ProfanityFilter.dictionary` is the bundled dictionary built without the

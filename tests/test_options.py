@@ -366,15 +366,21 @@ def test_runs_of_a_repeated_unit_block_word_are_masked_completely(english, unit)
 def test_block_occurrences_a_shortened_run_folds_together_are_one_match():
     # "$" * 14 keeps fewer characters for matching, so the occurrences from
     # offset 6 on ("$$$", "$$$", "$$") share letters: one match stands for
-    # them, as the most severe entry.
-    shield = ProfanityFilter(block=["$$$", "$$"], minimum_severity="extreme")
-    dictionary = copy.copy(shield.dictionary)
-    dictionary.severity_map = {**shield.dictionary.severity_map, "$$": Severity.EXTREME, "$$$": Severity.MILD}
-    shield.dictionary = dictionary
-    result = shield.check("$" * 14)
-    assert result.clean == "$" * 6 + "*" * 8
-    assert [(match.base, match.position, match.length) for match in result.matches] == [("$$", 6, 8)]
-    assert filter_text("$" * 14, block=["$$$", "$$"]).clean == "*" * 14
+    # them, as the most severe entry. Entries below minimum_severity have no
+    # occurrences, so they take nothing from those above it.
+    def shield(**options):
+        shield = ProfanityFilter(block=["$$$", "$$"], **options)
+        dictionary = copy.copy(shield.dictionary)
+        dictionary.severity_map = {**shield.dictionary.severity_map, "$$": Severity.EXTREME, "$$$": Severity.MILD}
+        shield.dictionary = dictionary
+        return shield
+
+    result = shield().check("$" * 14)
+    assert result.clean == "*" * 14
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("$$$", 0, 3), ("$$$", 3, 3), ("$$", 6, 8)]
+    result = shield(minimum_severity="extreme").check("$" * 14)
+    assert result.clean == "*" * 14
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("$$", 0, 2), ("$$", 2, 2), ("$$", 4, 2), ("$$", 6, 8)]
 
 
 def test_runs_of_a_repeated_block_word_keep_their_incomplete_rest():
@@ -392,6 +398,37 @@ def test_hex_like_runs_of_a_block_word_are_masked_only_when_complete():
     assert filter_text("0" * 11, block=["00"]).clean == "0" * 11
     assert filter_text("9" * 100, block=["9" * 40]).clean == "9" * 100
     assert filter_text("9" * 120, block=["9" * 40]).clean == "*" * 120
+
+
+def test_obfuscated_block_words_with_long_runs_are_caught():
+    # Shortening keeps an "o" run at 7, so the expression for a block word
+    # with ten "o"s never matched its obfuscated form; only the bare word, found
+    # as typed, was masked.
+    word = "z" + "o" * 10 + "q"
+    shield = ProfanityFilter(block=[word])
+    for text in [word, "z-" + "o" * 10 + "q", "z-" + "o" * 40 + "q", "z o" + "o" * 9 + "q"]:
+        assert shield.check(text).clean == "*" * len(text), text
+    # A run as short as shortening leaves it or shorter is still read as typed.
+    assert shield.check("z-" + "o" * 6 + "q").clean == "z-" + "o" * 6 + "q"
+
+
+@pytest.mark.parametrize("language", ["english", "german", "french", "spanish"])
+def test_block_words_with_interior_runs_are_caught_through_every_separator(language):
+    # Random letters with an interior run of 1..30 of one letter, obfuscated
+    # with each separator after the first letter. The entry is read as the
+    # language normalizes the text (Spanish "rrr" -> "r", German "sch" ->
+    # "sh") and with runs as shortening leaves them.
+    rng = random.Random(f"runs-{language}")
+    failures = []
+    for _ in range(12):
+        first, letter, last = (rng.choice(string.ascii_lowercase) for _ in range(3))
+        size = rng.randint(1, 30)
+        shield = ProfanityFilter(languages=language, block=[first + letter * size + last])
+        for separator in SEPARATORS:
+            text = first + separator + letter * size + last
+            if shield.check(text).clean != "*" * len(text):
+                failures.append((text, shield.check(text).clean))
+    assert not failures, failures[:10]
 
 
 def test_block_words_with_long_runs_do_not_affect_other_letters():
@@ -452,6 +489,62 @@ def test_a_longer_match_may_cover_an_explicit_block_entry(text, block, cleans, b
 
 
 SEVERITY_LEVELS = [None, "mild", "moderate", "high", "extreme"]
+
+
+def _masked(result):
+    assert len(result.clean) == len(result.original), result
+    return {index for index, character in enumerate(result.clean) if character != result.original[index]}
+
+
+@pytest.mark.parametrize(
+    "text, block, options",
+    [
+        # An entry below minimum_severity reserved its letters and was then
+        # dropped, so "wank" (high) was lost.
+        ("wanker", "wanker", {}),
+        # Readings partly over an entry's own text ("ge!" in "passage!", "sex!").
+        ("oh passage, passage!", "passage", {"languages": "french"}),
+        ("oh hardcoresex, hardcoresex!", "hardcoresex", {}),
+        # A reading across the gap between the entry's occurrences.
+        ("oh kkk, kkk!", "kkk", {}),
+        ("oh po, po!", "po", {"languages": "german"}),
+        ("oh dicksuck, dicksucker!", "dicksuck", {}),
+        # A word only the block list adds took letters a later pass's
+        # bundled match needed ("zugerauch|t" for "zugeraucht").
+        ("eingeaeschertzugeraucht", "zugerauch", {"languages": "german"}),
+        # Normalization joined two readings in one original character
+        # ("ssch" read as "sh"), and the second was dropped.
+        ("schmaehlichesschmaehliches", "hmaehliches", {"languages": "german"}),
+    ],
+)
+def test_a_block_entry_never_unmasks_anything(text, block, options):
+    for level in SEVERITY_LEVELS:
+        without = filter_text(text, minimum_severity=level, **options)
+        with_block = filter_text(text, minimum_severity=level, block=[block], **options)
+        assert _masked(without) <= _masked(with_block), (level, without.clean, with_block.clean)
+
+
+@pytest.mark.parametrize("language, count", [("english", 25), ("german", 10), ("french", 10), ("spanish", 10)])
+def test_adding_a_block_entry_never_reduces_masking(language, count):
+    # For any text, options and block word: what is masked with block=[word]
+    # includes what is masked without it, at every minimum_severity. Words:
+    # bundled entries, their prefixes, suffixes, inner parts and extensions,
+    # and unrelated ordinary words; texts built from them and other entries.
+    data = json.loads((ROOT / "profy" / "data" / "languages" / f"{language}.json").read_text(encoding="utf-8"))
+    rng = random.Random(f"block-{language}")
+    entries = sorted({word.lower() for word in data["profanities"] if word.isalpha()})
+    ordinary = ["hello", "class", "assessment", "cocktail", "shell", "night", "passion", "basement"]
+    plain = {level: ProfanityFilter(languages=language, minimum_severity=level) for level in SEVERITY_LEVELS}
+    for _ in range(count):
+        entry, other = rng.choice(entries), rng.choice(entries)
+        word = rng.choice(
+            [entry, entry[: max(2, len(entry) - 2)], entry[2:] or entry, entry[1:-1] or entry, entry + "s", entry + "x", rng.choice(ordinary)]
+        )
+        texts = [entry, word, entry + other, other + entry, f"{entry} {other}", word + other, f"oh {word}, {entry}!", entry * 2, word * 2]
+        for level in SEVERITY_LEVELS:
+            blocked = ProfanityFilter(languages=language, minimum_severity=level, block=[word])
+            for text in texts:
+                assert _masked(plain[level].check(text)) <= _masked(blocked.check(text)), (word, level, text)
 
 
 def test_long_block_words_do_not_stop_stretched_words_with_their_letter():

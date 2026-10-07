@@ -31,6 +31,26 @@ def _with_extra_expressions(shield, *extra):
     return shield
 
 
+def test_a_later_match_reports_only_what_is_left_of_a_shared_character():
+    # German reads "\u00e4" as "ae". The first pass selects "e#cd" (it covers
+    # more than "!ae"); the second finds "!a", whose "a" comes from the "\u00e4"
+    # the first already reported, so it reports only "!". A reading made of
+    # nothing but such a character reports nothing.
+    shield = _with_extra_expressions(
+        ProfanityFilter(languages="german", block=["zz-shared"]),
+        ("zz-x", re.compile("!ae?")),
+        ("zz-y", re.compile("e#cd")),
+    )
+    result = _within(30, shield.check, "!\u00e4#cd")
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-x", 0, 1), ("zz-y", 1, 4)]
+    assert result.clean == "*****"
+    shield = _with_extra_expressions(
+        ProfanityFilter(languages="german", block=["zz-shared"]), ("zz-x", re.compile("!a")), ("zz-y", re.compile("e"))
+    )
+    result = _within(30, shield.check, "!\u00e4")
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-x", 0, 2)]
+
+
 def test_scan_loop_never_accepts_zero_length_matches():
     shield = _with_extra_expressions(ProfanityFilter(block=["zz-empty"]), ("", re.compile(r"(?=!)|$")))
     result = _within(30, shield.check, "! shit !")
@@ -253,17 +273,18 @@ def test_longest_needed_run():
 
 
 def test_matches_never_share_original_characters():
-    # Defensive invariant: even if two expressions match neighbouring normalized
-    # characters that come from one original character, only one match is kept.
-    # German normalizes "\u00e4" to "ae": "!a" and "e#" share the original "\u00e4".
+    # Two expressions can match neighbouring normalized characters that come
+    # from one original character: German normalizes "\u00e4" to "ae", so "!a"
+    # and "e#" share the original "\u00e4". The later match reports what is
+    # left of it, so no character is reported twice and none is lost.
     shield = _with_extra_expressions(
         ProfanityFilter(languages="german", block=["zz-overlap"]),
         ("zz-a", re.compile("!a")),
         ("zz-e", re.compile("e#")),
     )
     result = _within(30, shield.check, "!\u00e4#")
-    assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-a", 0, 2)]
-    assert result.clean == "**#"
+    assert [(match.base, match.position, match.length) for match in result.matches] == [("zz-a", 0, 2), ("zz-e", 2, 1)]
+    assert result.clean == "***"
 
 
 def _shortener(words, substitutions, floor=3, separators=("-",)):
@@ -421,17 +442,6 @@ def test_select_tie_breaks():
     assert _spans(core._select([_candidate(0, 3, "aaa"), _candidate(3, 6, "bbb"), _candidate(0, 6, "ab")], never)) == [(0, 6, "ab")]
     assert _spans(core._select([_candidate(1, 4, "late"), _candidate(0, 3, "early")], never)) == [(0, 3, "early")]
     assert _spans(core._select([_candidate(0, 3, "two", order=2), _candidate(0, 3, "one", order=1)], never)) == [(0, 3, "one")]
-
-
-def test_select_covers_required_positions():
-    never = lambda index: False  # noqa: E731
-    required = bytearray(10)
-    required[2:4] = b"\x01\x01"
-    hit = _candidate(2, 4, "hit", order=-1, reported=False)
-    # A required span is covered by itself, or by a longer candidate containing
-    # it, even when that loses reported characters elsewhere.
-    assert _spans(core._select([hit, _candidate(0, 3, "abc")], never, required)) == [(2, 4, "hit")]
-    assert _spans(core._select([hit, _candidate(1, 6, "wide")], never, required)) == [(1, 6, "wide")]
 
 
 STRATEGY_TEXTS = [

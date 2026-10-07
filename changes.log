@@ -1,5 +1,62 @@
 # Profy Changes Log
 
+## 2026-10-07 (fix/codex-review-hardening, Codex review pass 15)
+- P2 block entries below minimum_severity suppressed reportable matches
+  ("wanker" with block=["wanker"] at high: clean, "****er" without it): its
+  exact hit was required and excluded the overlapping "wank", then was not
+  reported. Entries below minimum_severity now have no hits at all, and
+  hits stopped being selection candidates: they are masked whatever the
+  pass selects (no `required`, no `splits_a_hit`, no `_Candidate.span`); a
+  reported reading strictly holding one is reported instead (`_holds`), one
+  overlapping it partly besides it, a reading with the same span adds
+  nothing. The first pass weighs a reading by what it covers outside the
+  hits first, then by all it covers (`_Candidate.spare`), so a reading
+  reaching past a hit ("ge!" in "passage!") or across the gap between two
+  ("kkk, kkk") still wins as without the entry.
+- Monotonicity (adding block=[B] never unmasks a character), found by a
+  probe ($S/blockmono.py: B = an entry, its prefix/suffix/inner part/
+  extension or an ordinary word; 12 texts; every minimum_severity; 4
+  languages) and fixed:
+  * Words only the block list adds (`_Dictionary.added`) are selected after
+    the bundled words' readings, among themselves, next to those and
+    weighed by what those leave; they are reported but not masked in the
+    working text, so the bundled words' later passes run as without them
+    ("zugerauch" took "zugeraucht"'s letters before its second pass).
+  * Readings sharing an original character that normalization split in two
+    ("ssch" read as "sh" between two "schmaehliches"; "ä" as "ae"): the
+    later report used to be dropped; each now reports what is left of it.
+    `test_matches_never_share_original_characters` changes accordingly
+    ("!ä#": "zz-e" is reported as "#").
+  Strict invariant over all characters, final code: 0 violations in
+  216,000 checks (3 seeds x 4 languages x 300 cases x 5 levels x 12
+  texts), and 432,000 on the step before; r15 fails 5 of the 8 regression
+  texts. Property test in the suite (55 cases, ~15s).
+- P2 separator-obfuscated block entries with long runs: block-only words'
+  expressions are built from the word as the language normalizes it
+  (`normalize`, so Spanish "rrr" -> "r" and German "sch" -> "sh" as in the
+  text) with every run longer than shortening leaves cut to the shortest
+  run it leaves for those characters, its last letter reading on
+  (`_RunShortener.fit`, `retained()` replaces `kept()`; `_compile_tokens`).
+  Chosen over matching block expressions on a separate unshortened text,
+  which would need a second normalization, finder and run bounds for words
+  that may be hundreds of characters long: this keeps the same expression
+  machinery, so worst-case time is unchanged. Trade-off: such a word's
+  obfuscated form matches any run of that letter at least as long as
+  shortening keeps it, which the shortened text cannot tell apart anyway.
+  Bundled words are never refitted (shortening keeps their runs).
+  Expressions of replaced words drop their id()-keyed stop classes, so a
+  reused id never finds a stale one. Property test: random letters with an
+  interior run of 1..30, each separator, 4 languages (r15 fails all four);
+  probe over 7,440 texts: 0 failures.
+- Simplifications: `_CandidateFinder` no longer merges changed spans (they
+  arrive merged, `_merge_spans`); `_select` lost `required`.
+- Differential vs r15, all 40 corpus runs: 0 differing results; sweep (789)
+  and dictionary scan (845) identical. Windowed/compacted vs full rescan: 0
+  diffs, also with 17 block entries. Throughput and tiny checks within 1%,
+  filters with block lists too; adversarial worst cases +1-7% ("*-" * 150
+  English 0.31s -> 0.34s, "* " * 200 all languages 0.89s -> 0.94s).
+  core.py 1251 -> 1325 statements.
+
 ## 2026-10-07 (fix/codex-review-hardening, Codex review pass 14)
 - P1 quadratic with a block-only dictionary (d32a146): since pass 11 the run
   shortener ignored block entries entirely, so with only block entries no

@@ -318,8 +318,8 @@ class _KeepRuns:
     def shorten(self, text, span_map):
         return text, span_map
 
-    def kept(self, character):
-        return 0
+    def retained(self, character):
+        return 0, 0
 
 
 @pytest.mark.parametrize(

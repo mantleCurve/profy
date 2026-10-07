@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "profy-filter"
-version = "0.1.2"
+version = "0.2.0"
 description = "A Python profanity filter forked from Blaspsoft/blasp."
 readme = "README.md"
 requires-python = ">=3.9"

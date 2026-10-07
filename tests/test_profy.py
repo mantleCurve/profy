@@ -3,7 +3,7 @@ from profy import ProfanityFilter, Severity, check_text, clean_text, filter_text
 
 
 def test_version_is_exported():
-    assert profy.__version__ == "0.1.2"
+    assert profy.__version__ == "0.2.0"
 
 
 def test_straight_match_masks_text():
